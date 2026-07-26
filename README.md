@@ -44,6 +44,9 @@ Allowed: a fixed list of read-only tools (`ls cat head tail wc grep rg stat du d
 | `fd` | `-x` `-X` `--exec` `--exec-batch` |
 | `tree` | `-o` |
 | `uniq` | a second operand (it is an output file) |
+| `gh` | any method but `GET`/`HEAD`; request fields (`-f`/`-F`, which switch gh to POST) unless the method is explicitly GET; `--input`; `graphql`; any subcommand outside a read-only set |
+
+`gh` deserves a note. `gh api` is a raw authenticated client for the entire GitHub API, so what it can do equals the token's scopes — with a typical `repo, workflow, gist, admin:public_key` token that includes rewriting history, writing `.github/workflows/*.yml` (arbitrary code execution on runners with your secrets), and adding SSH keys to the account. A prefix rule like `Bash(gh api *)` cannot express "GET only", which is exactly why this belongs in a parser. Repo research (`gh api repos/...`, `gh repo view`, `gh pr list`) passes; `gh api -X DELETE`, `gh repo create`, `gh pr merge`, `gh secret set` prompt.
 
 Rejected outright: output redirection to anything but `/dev/null`-style targets, heredocs, process substitution, backticks, indirect execution (`$CMD`, `eval`), interpreters (`python3 -c`, `bash script.sh`), `xargs`, and any command not on the list.
 
@@ -109,7 +112,7 @@ The bash half spawns no subprocesses; `python3` starts only for Bash calls made 
 python3 tests/test_readonly_cmd.py
 ```
 
-184 cases covering the allow set, the escape techniques above, and regressions. Two bugs found by this suite, both of which wrongly *allowed* commands:
+222 cases covering the allow set, the escape techniques above, and regressions. Two bugs found by this suite, both of which wrongly *allowed* commands:
 
 - `printf ... | exec python3 ...` — `exec` inside a pipeline replaces the subshell, not the script, so the script continued to the blanket-allow line and approved `rm -rf`.
 - The tokenizer checked `isspace()` before operator matching, so a newline was swallowed as whitespace and `ls\nrm -rf /tmp/x` parsed as `ls` with `rm` as an argument.

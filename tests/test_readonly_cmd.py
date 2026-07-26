@@ -233,7 +233,56 @@ for _cmd, _want in HARDENING:
         hard_fail += 1
 print("hardening: %d/%d passed" % (len(HARDENING) - hard_fail, len(HARDENING)))
 
-total = len(ALLOW) + len(DENY) + len(EXTRA) + len(HARDENING)
-total_fail = fails + extra_fail + hard_fail
+# --- appended: `gh` is a raw GitHub API client, so it is gated to GET/HEAD
+# --- plus a read-only subcommand set. Repo research works; writes prompt.
+GH = [
+    ("gh api repos/uwonu606/claude-plan-mode-autoallow", True),
+    ("gh api users/uwonu606 --jq '.id'", True),
+    ("gh api repos/cli/cli/releases --paginate", True),
+    ("gh api /repos/{owner}/{repo}/pulls", True),
+    ("gh api search/repositories -X GET -f q=hooks", True),
+    ("gh api repos/x/y -H 'Accept: application/vnd.github+json'", True),
+    ("gh api rate_limit --method GET", True),
+    ("gh repo view cli/cli", True),
+    ("gh repo list uwonu606", True),
+    ("gh pr list --state open", True),
+    ("gh pr diff 42", True),
+    ("gh issue view 7", True),
+    ("gh run list --limit 5", True),
+    ("gh release view v1.0", True),
+    ("gh search repos claude hooks", True),
+    ("gh auth status", True),
+    ("gh api repos/x/y | jq '.stargazers_count'", True),
+    ("for r in a b; do gh api repos/uwonu606/$r --jq .name; done", True),
+    ("gh api -X DELETE repos/uwonu606/test", False),
+    ("gh api --method DELETE repos/x/y", False),
+    ("gh api -X PATCH repos/x/y -f name=z", False),
+    ("gh api repos/x/y/issues -f title=hi", False),
+    ("gh api repos/x/y/issues -F title=@body.txt", False),
+    ("gh api --method=POST repos/x/y/forks", False),
+    ("gh api graphql -f query='mutation{...}'", False),
+    ("gh api graphql", False),
+    ("gh api user/keys --input key.json", False),
+    ("gh repo create newrepo --public", False),
+    ("gh repo delete x", False),
+    ("gh repo clone x", False),
+    ("gh pr merge 42", False),
+    ("gh pr create --title x", False),
+    ("gh release create v1", False),
+    ("gh run download 123", False),
+    ("gh secret set TOKEN", False),
+    ("gh gist create f.txt", False),
+    ("gh auth token", False),
+    ("gh api repos/x/y && gh api -X DELETE repos/x/y", False),
+]
+gh_fail = 0
+for _cmd, _want in GH:
+    if is_read_only(_cmd) != _want:
+        print("FAIL (gh, want %s): %r" % (_want, _cmd))
+        gh_fail += 1
+print("gh: %d/%d passed" % (len(GH) - gh_fail, len(GH)))
+
+total = len(ALLOW) + len(DENY) + len(EXTRA) + len(HARDENING) + len(GH)
+total_fail = fails + extra_fail + hard_fail + gh_fail
 print("TOTAL: %d/%d passed" % (total - total_fail, total))
 sys.exit(1 if total_fail else 0)

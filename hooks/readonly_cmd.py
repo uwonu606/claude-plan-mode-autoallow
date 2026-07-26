@@ -85,6 +85,31 @@ SED_FLAGS_OK = {"-n", "-E", "-r", "-z", "-u", "-s", "--quiet", "--silent",
 
 FD_BAD = {"-x", "-X", "--exec", "--exec-batch"}
 
+# `gh api` is a raw authenticated client for the whole GitHub API, so what it
+# can do equals the token's scopes. Only GET/HEAD is accepted. Note that gh
+# switches to POST as soon as any request field is present, so field flags are
+# rejected unless the method is explicitly GET/HEAD.
+GH_API_FIELD_FLAGS = {"-f", "--raw-field", "-F", "--field"}
+GH_API_VALUE_FLAGS = {"-H", "--header", "-p", "--preview", "-q", "--jq",
+                      "-t", "--template", "--cache", "--hostname", "--slurp"}
+GH_READ_SUBCOMMANDS = {
+    "repo": {"view", "list"},
+    "pr": {"view", "list", "diff", "status", "checks"},
+    "issue": {"view", "list", "status"},
+    "run": {"view", "list"},
+    "workflow": {"view", "list"},
+    "release": {"view", "list"},
+    "gist": {"view", "list"},
+    "label": {"list"},
+    "search": {"repos", "issues", "prs", "code", "commits"},
+    "auth": {"status"},
+    "cache": {"list"},
+    "extension": {"list"},
+    "org": {"list"},
+    "status": set(),
+    "version": set(),
+}
+
 REDIR_OK_TARGETS = {"/dev/null", "/dev/stdout", "/dev/stderr"}
 
 # rg can execute a preprocessor binary and read archives through helpers.
@@ -530,6 +555,67 @@ def check_jq(args):
             raise Deny("jq program contains %r" % bad)
 
 
+def check_gh_api(args):
+    method = None
+    has_field = False
+    endpoint = None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-X", "--method"):
+            i += 1
+            if i >= len(args):
+                raise Deny("gh api --method without a value")
+            method = unquote(args[i]).upper()
+        elif a.startswith("--method="):
+            method = unquote(a.split("=", 1)[1]).upper()
+        elif a in ("--input",) or a.startswith("--input="):
+            raise Deny("gh api --input sends a request body")
+        elif a in GH_API_FIELD_FLAGS:
+            has_field = True
+            i += 1  # its value
+        elif any(a.startswith(f + "=") for f in GH_API_FIELD_FLAGS
+                 if f.startswith("--")):
+            has_field = True
+        elif a in GH_API_VALUE_FLAGS:
+            i += 1  # its value, so it is not mistaken for the endpoint
+        elif not a.startswith("-") and endpoint is None:
+            endpoint = unquote(a)
+        i += 1
+
+    if method is not None and method not in ("GET", "HEAD"):
+        raise Deny("gh api -X %s" % method)
+    if has_field and method not in ("GET", "HEAD"):
+        raise Deny("gh api request fields switch the method to POST")
+    if endpoint and endpoint.lower() == "graphql":
+        raise Deny("gh api graphql")
+
+
+def check_gh(args):
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        if args[i] in ("-R", "--repo"):
+            i += 2
+            continue
+        i += 1
+    if i >= len(args):
+        return  # bare `gh` prints help
+
+    sub = unquote(args[i])
+    rest = args[i + 1:]
+    if sub == "api":
+        return check_gh_api(rest)
+    if sub not in GH_READ_SUBCOMMANDS:
+        raise Deny("gh %s" % sub)
+
+    allowed = GH_READ_SUBCOMMANDS[sub]
+    if not allowed:
+        return  # `gh status`, `gh version`
+    action = next((unquote(a) for a in rest if not a.startswith("-")), None)
+    if action not in allowed:
+        raise Deny("gh %s %s" % (sub, action))
+
+
 def check_uniq(args):
     operands = []
     skip_next = False
@@ -611,6 +697,7 @@ CHECKERS = {
     "jq": check_jq,
     "rg": check_rg,
     "file": check_file,
+    "gh": check_gh,
 }
 
 
