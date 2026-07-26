@@ -96,27 +96,47 @@ cd claude-plan-mode-autoallow
 
 ## 거부 로그
 
-default deny라는 건 allowlist가 영원히 완성되지 않는다는 뜻이다 — 아직 못 본 읽기 전용 명령이 항상 남아 있다. 그래서 파서가 거부한 plan mode Bash 명령은 거부한 규칙과 함께 `~/.claude/plan-mode-autoallow-denied.jsonl`에 적립된다:
+default deny라는 건 allowlist가 영원히 완성되지 않는다는 뜻이다 — 아직 못 본 읽기 전용 명령이 항상 남아 있다. 그래서 파서가 거부한 plan mode Bash 명령은 거부한 규칙과 함께 적립된다:
 
-```json
-{"ts":"2026-07-26T17:48:59+0900","reason":"command not on read-only allowlist: 'rm'","command":"rm -rf /tmp/x","cwd":"/srv/project"}
+```
+~/.claude/plan-mode-autoallow/
+├─ README.md        install.sh가 쓴다. 이 디렉터리가 뭔지, --report를 어떻게 돌리는지
+├─ denied.jsonl
+└─ denied.jsonl.1   2 MB 넘으면 밀려난 이전 파일
 ```
 
-핵심은 이유 쪽이다. 셸 줄만 모아둔 로그는 *뭔가 프롬프트가 떴다*까지만 알려주지만, 이유가 붙으면 *어느 규칙과 다툴 것인지*가 나온다. allowlist를 넓힐지, 인자 검사를 완화할지, 그냥 둘지를 가르는 게 그 정보다.
+로그를 훅 옆이 아니라 자기 디렉터리에 두는 이유는, 이 파일이 맥락 없이 발견되는 유일한 파일이기 때문이다. 몇 달 뒤 다른 걸 찾다가 `~/.claude`를 뒤지던 사람이 마주치는 자리에 설명이 같이 있어야 한다.
 
-분류하려면:
+레코드 한 줄:
+
+```json
+{"ts":"2026-07-26T18:36:28+0900","rule":"command not on read-only allowlist","detail":"docker","reason":"command not on read-only allowlist: 'docker'","command":"docker ps","cwd":"/srv/project"}
+```
+
+`rule`과 `detail`이 나뉘어 있는 게 핵심이다. 파서의 거부 메시지는 대부분 값을 품는다 — `output redirection to 'a.txt'`, `find -delete`. 이걸 한 문장으로 저장하면 파일명 하나마다 별개의 버킷이 생겨서, 정작 이 로그를 읽는 이유인 *어느 규칙이 제일 자주 걸리나*에 답할 수 없다. `rule`은 값이 빠진 고정 문자열이라 집계 키가 되고, `detail`은 그 안에서 다시 묶인다. `reason`은 둘을 합친 문장인데, 이 파일을 처음 보는 방법이 대개 `tail`이기 때문에 남겨둔다.
+
+집계해서 보려면:
 
 ```sh
 python3 hooks/readonly_cmd.py --report
 ```
 
-이유별로 묶고 최빈 명령을 나열한다. 하루에 스무 번 걸리는 규칙과 한 번도 안 걸린 규칙이 나란히 보인다.
+```
+9  command not on read-only allowlist
+   npm×2  rm×2  docker×1  python3×1  cargo×1  make×1  (+1 more)
+3  output redirection to
+   a.txt×1  b.txt×1  c.txt×1
+2  gh
+   pr merge×1  repo delete×1
+```
+
+규칙별 건수와 규칙 안의 값별 건수가 같이 나온다. 첫 줄이 `command not on read-only allowlist`이고 `detail`에 같은 명령이 반복되면 allowlist에 넣을 후보다. 로테이션된 `.1`도 같이 읽는다 — 오래 모인 데이터가 거기 있다.
 
 | | |
 |---|---|
-| 경로 | `PLAN_MODE_AUTOALLOW_LOG=/some/path`, 끄려면 `off`. `CLAUDE_CONFIG_DIR`이 설정돼 있으면 그 아래를 기본값으로 쓴다. |
+| 경로 | `PLAN_MODE_AUTOALLOW_LOG=/some/path`, 끄려면 `off`. `CLAUDE_CONFIG_DIR`이 설정돼 있으면 그 아래를 기본값으로 쓴다. 없는 상위 디렉터리는 만든다. |
 | 로테이션 | 2 MB에서 `.jsonl.1`로 이름을 바꾸고 새로 시작한다. 한꺼번에 몰려도 정작 들여다보게 만든 항목을 버리지 않는다. |
-| 권한 | `0600`으로 만든다. 명령줄 전체가 들어가므로 셸 히스토리처럼 다뤄야 한다. |
+| 권한 | 디렉터리 `0700`, 파일 `0600`. 명령줄 전체가 들어가므로 셸 히스토리처럼 다뤄야 한다. |
 | 실패 | 쓸 수 없는 로그는 무시한다. 권한 판정을 바꾸거나 막는 일은 절대 없다. |
 
 읽을 때 주의할 점 하나. 로그에 있다고 해서 반드시 프롬프트가 떴던 건 아니다. 훅이 침묵하면 판정이 평소 흐름으로 넘어가고, 거기서 `permissions.allow` 규칙이 덮었을 수 있다. 이 로그는 *이 파서가* 거부한 명령의 집합이고, 검토할 가치가 있는 것도 그 집합이다.
@@ -140,7 +160,7 @@ bash 쪽 절반은 서브프로세스를 하나도 띄우지 않는다. `python3
 python3 tests/test_readonly_cmd.py
 ```
 
-allow 집합, 위에 적은 우회 기법들, 거부 로그, 그리고 회귀를 덮는 241개 케이스. 이 스위트가 잡아낸 버그 둘은 모두 명령을 잘못 *허용*하는 쪽이었다:
+allow 집합, 위에 적은 우회 기법들, 거부 로그, 그리고 회귀를 덮는 252개 케이스. 이 스위트가 잡아낸 버그 둘은 모두 명령을 잘못 *허용*하는 쪽이었다:
 
 - `printf ... | exec python3 ...` — 파이프라인 안의 `exec`는 스크립트가 아니라 서브셸을 대체하므로, 스크립트가 계속 진행해 무조건 허용 줄까지 내려가 `rm -rf`를 승인했다.
 - 토크나이저가 연산자 매칭보다 `isspace()`를 먼저 검사해서 개행이 공백으로 삼켜졌고, `ls\nrm -rf /tmp/x`가 `rm`을 인자로 가진 `ls`로 파싱됐다.

@@ -309,8 +309,14 @@ def run_main(command, cwd=None):
 def read_log(path):
     if not os.path.exists(path):
         return []
+    rows = []
     with open(path, encoding="utf-8") as fh:
-        return [_json.loads(l) for l in fh if l.strip()]
+        for line in fh:
+            try:
+                rows.append(_json.loads(line))
+            except ValueError:
+                continue
+    return rows
 
 
 log_checks = []
@@ -321,6 +327,7 @@ def log_check(name, ok):
 
 
 _saved_env = os.environ.get("PLAN_MODE_AUTOALLOW_LOG")
+_saved_dir = os.environ.get("CLAUDE_CONFIG_DIR")
 _tmp = tempfile.mkdtemp(prefix="autoallow-log-")
 try:
     logfile = os.path.join(_tmp, "denied.jsonl")
@@ -332,6 +339,11 @@ try:
     log_check("denial logs the command",
               rows and rows[0].get("command") == "rm -rf /tmp/x")
     log_check("denial logs a reason", rows and rows[0].get("reason"))
+    log_check("denial logs a rule", rows and rows[0].get("rule"))
+    log_check("denial logs the detail separately",
+              rows and rows[0].get("detail") == "rm")
+    log_check("rule holds no variable part",
+              rows and "rm" not in rows[0].get("rule", "rm"))
     log_check("denial logs cwd", rows and rows[0].get("cwd") == "/srv/project")
     log_check("denial prints no decision", out == "")
     log_check("log file is not world-readable",
@@ -363,14 +375,35 @@ try:
     log_check("explain returns None when allowed",
               readonly_cmd.explain("ls -la") is None)
     log_check("explain names the sed rule",
-              "sed" in (readonly_cmd.explain("sed -i s/a/b/ f") or "").lower())
+              "sed" in (readonly_cmd.explain("sed -i s/a/b/ f") or {})
+              .get("reason", "").lower())
     log_check("explain names the cd/git rule",
-              "cd" in (readonly_cmd.explain("cd /x && git log") or "").lower())
+              "cd" in (readonly_cmd.explain("cd /x && git log") or {})
+              .get("reason", "").lower())
 
-    # --report must survive a log containing a malformed line.
+    # The point of splitting rule from detail: two rejections that differ only
+    # in the value must land in the same bucket.
+    a = readonly_cmd.explain("echo x > a.txt")
+    b = readonly_cmd.explain("echo y > b.txt")
+    log_check("same rule for different targets", a["rule"] == b["rule"])
+    log_check("details differ", a["detail"] != b["detail"])
+    log_check("reasons still differ", a["reason"] != b["reason"])
+    log_check("multi-argument rule keeps both values",
+              readonly_cmd.explain("gh pr merge 1")["detail"] == "pr merge")
+
+    # --report must survive a malformed line and must include the rotated file.
     os.environ["PLAN_MODE_AUTOALLOW_LOG"] = logfile
     with open(logfile, "a", encoding="utf-8") as fh:
         fh.write("not json\n")
+    with open(logfile + ".1", "w", encoding="utf-8") as fh:
+        fh.write(_json.dumps({"ts": "2026-01-01T00:00:00+0900",
+                              "rule": "older rule", "detail": "x",
+                              "reason": "older rule x",
+                              "command": "old cmd"}) + "\n")
+    log_check("load_log reads the rotated file too",
+              len(readonly_cmd.load_log(logfile)) > len(read_log(logfile)))
+    log_check("rotated entries come first",
+              readonly_cmd.load_log(logfile)[0].get("rule") == "older rule")
     stdout = sys.stdout
     sys.stdout = io.StringIO()
     try:
@@ -379,12 +412,29 @@ try:
     finally:
         sys.stdout = stdout
     log_check("report succeeds", rc == 0)
-    log_check("report counts denials", "1 denials" in text or "denials" in text)
+    log_check("report groups by rule", "denials" in text and "rules" in text)
+
+    # Default location: its own directory, not loose in the config root.
+    os.environ.pop("PLAN_MODE_AUTOALLOW_LOG", None)
+    os.environ["CLAUDE_CONFIG_DIR"] = _tmp
+    default = readonly_cmd.log_path()
+    log_check("default log sits in its own directory",
+              default == os.path.join(_tmp, "plan-mode-autoallow",
+                                      "denied.jsonl"))
+    os.environ["PLAN_MODE_AUTOALLOW_LOG"] = os.path.join(
+        _tmp, "made", "up", "denied.jsonl")
+    run_main("rm -rf /tmp/w")
+    log_check("missing parent directories are created",
+              os.path.exists(os.path.join(_tmp, "made", "up", "denied.jsonl")))
 finally:
     if _saved_env is None:
         os.environ.pop("PLAN_MODE_AUTOALLOW_LOG", None)
     else:
         os.environ["PLAN_MODE_AUTOALLOW_LOG"] = _saved_env
+    if _saved_dir is None:
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+    else:
+        os.environ["CLAUDE_CONFIG_DIR"] = _saved_dir
     import shutil
     shutil.rmtree(_tmp, ignore_errors=True)
 

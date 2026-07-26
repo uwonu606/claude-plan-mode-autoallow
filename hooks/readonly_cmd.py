@@ -141,7 +141,21 @@ SEEN_COMMANDS = []
 
 
 class Deny(Exception):
-    pass
+    """A rejection, split into the rule that fired and the value that tripped it.
+
+    Callers pass the format template and its arguments separately -- `Deny("find
+    %s", flag)` rather than `Deny("find %s" % flag)` -- so the constant half can
+    be recovered. Without that split the denial log cannot be grouped: every
+    rejected filename produces its own "output redirection to 'a.txt'" bucket,
+    and the one question the log exists to answer -- which rule fires most --
+    becomes unanswerable.
+    """
+
+    def __init__(self, template, *args):
+        Exception.__init__(self, template % args if args else template)
+        self.rule = template.replace("%s", "").replace("%r", "")
+        self.rule = " ".join(self.rule.split()).rstrip(":,- ")
+        self.detail = " ".join(str(a) for a in args) if args else None
 
 
 # ---------------------------------------------------------------- scanning
@@ -383,7 +397,7 @@ def consume_output_redirect(cmd, i, buf, tokens):
         j += 1
     target = cmd[i:j].strip("\"'")
     if target not in REDIR_OK_TARGETS:
-        raise Deny("output redirection to %r" % target)
+        raise Deny("output redirection to %r", target)
     return j
 
 
@@ -409,7 +423,7 @@ def unquote(word):
 def check_find(args):
     for a in args:
         if a in FIND_BAD or a.startswith("-fprint"):
-            raise Deny("find %s" % a)
+            raise Deny("find %s", a)
 
 
 def check_sort(args):
@@ -424,7 +438,7 @@ def check_awk(args):
     blob = " ".join(unquote(a) for a in args).lower()
     for bad in AWK_BAD:
         if bad in blob:
-            raise Deny("awk program contains %r" % bad)
+            raise Deny("awk program contains %r", bad)
     i = 0
     while i < len(blob):
         if blob[i] == ">":
@@ -459,7 +473,7 @@ def check_sed(args):
             if a in SED_FLAGS_OK:
                 i += 1
                 continue
-            raise Deny("sed flag %s" % a)
+            raise Deny("sed flag %s", a)
         if not script_seen:
             check_sed_script(unquote(a))
             script_seen = True
@@ -473,13 +487,13 @@ def check_sed_script(script):
     for pattern in SED_SAFE_PATTERNS:
         if re.match(pattern, script):
             return
-    raise Deny("sed script not in the recognized read-only set: %r" % script)
+    raise Deny("sed script not in the recognized read-only set: %r", script)
 
 
 def check_fd(args):
     for a in args:
         if a in FD_BAD or a.startswith("--exec"):
-            raise Deny("fd %s" % a)
+            raise Deny("fd %s", a)
 
 
 def check_tree(args):
@@ -519,7 +533,7 @@ def has_unquoted_glob(word):
 def check_glob_sensitive(cmd, args):
     for a in args:
         if has_unquoted_glob(a):
-            raise Deny("unquoted glob next to %s can expand to a flag" % cmd)
+            raise Deny("unquoted glob next to %s can expand to a flag", cmd)
 
 
 def check_rg(args):
@@ -527,7 +541,7 @@ def check_rg(args):
         if a in RG_BAD_FLAGS or any(
             a.startswith(f + "=") for f in RG_BAD_FLAGS if f.startswith("--")
         ):
-            raise Deny("rg %s" % a)
+            raise Deny("rg %s", a)
 
 
 def check_file(args):
@@ -535,24 +549,24 @@ def check_file(args):
         if a in FILE_BAD_FLAGS or any(
             a.startswith(f + "=") for f in FILE_BAD_FLAGS if f.startswith("--")
         ):
-            raise Deny("file %s" % a)
+            raise Deny("file %s", a)
 
 
 def check_jq(args):
     for a in args:
         if a in JQ_BAD_FLAGS:
-            raise Deny("jq %s" % a)
+            raise Deny("jq %s", a)
         for flag in JQ_BAD_FLAGS:
             if flag.startswith("--") and a.startswith(flag + "="):
-                raise Deny("jq %s" % a)
+                raise Deny("jq %s", a)
         if a.startswith("-") and not a.startswith("--") and (
             "f" in a[1:] or "L" in a[1:]
         ):
-            raise Deny("jq %s" % a)
+            raise Deny("jq %s", a)
     program = " ".join(unquote(a) for a in args if not a.startswith("-"))
     for bad in JQ_BAD_PROGRAM:
         if bad in program:
-            raise Deny("jq program contains %r" % bad)
+            raise Deny("jq program contains %r", bad)
 
 
 def check_gh_api(args):
@@ -584,7 +598,7 @@ def check_gh_api(args):
         i += 1
 
     if method is not None and method not in ("GET", "HEAD"):
-        raise Deny("gh api -X %s" % method)
+        raise Deny("gh api -X %s", method)
     if has_field and method not in ("GET", "HEAD"):
         raise Deny("gh api request fields switch the method to POST")
     if endpoint and endpoint.lower() == "graphql":
@@ -606,14 +620,14 @@ def check_gh(args):
     if sub == "api":
         return check_gh_api(rest)
     if sub not in GH_READ_SUBCOMMANDS:
-        raise Deny("gh %s" % sub)
+        raise Deny("gh %s", sub)
 
     allowed = GH_READ_SUBCOMMANDS[sub]
     if not allowed:
         return  # `gh status`, `gh version`
     action = next((unquote(a) for a in rest if not a.startswith("-")), None)
     if action not in allowed:
-        raise Deny("gh %s %s" % (sub, action))
+        raise Deny("gh %s %s", sub, action)
 
 
 def check_uniq(args):
@@ -660,7 +674,7 @@ def check_git(args):
     sub = args[idx]
     rest = args[idx + 1:]
     if sub not in GIT_READ_SUBCOMMANDS:
-        raise Deny("git %s" % sub)
+        raise Deny("git %s", sub)
 
     if sub == "config":
         if not any(r.startswith(("--get", "--list", "-l")) for r in rest):
@@ -671,15 +685,15 @@ def check_git(args):
             if not r.startswith("-"):
                 raise Deny("git branch operand")
             if r in GIT_BRANCH_MUTATE or r.startswith("--set-upstream"):
-                raise Deny("git branch %s" % r)
+                raise Deny("git branch %s", r)
     elif sub == "remote":
         action = next((r for r in rest if not r.startswith("-")), None)
         if action is not None and action not in ("show", "get-url"):
-            raise Deny("git remote %s" % action)
+            raise Deny("git remote %s", action)
     elif sub == "reflog":
         action = next((r for r in rest if not r.startswith("-")), None)
         if action is not None and action != "show":
-            raise Deny("git reflog %s" % action)
+            raise Deny("git reflog %s", action)
 
 
 CHECKERS = {
@@ -718,7 +732,7 @@ def validate_command(words, depth=0):
     for a in assignments:
         name = a.split("=", 1)[0]
         if name not in ENV_PREFIX_OK and not name.startswith("LC_"):
-            raise Deny("%s= prefixes a command" % name)
+            raise Deny("%s= prefixes a command", name)
 
     cmd = unquote(words[0])
     args = words[1:]
@@ -734,7 +748,7 @@ def validate_command(words, depth=0):
         raise Deny("indirect command")
     if "/" in cmd:
         if not (cmd.startswith("/usr/bin/") or cmd.startswith("/bin/")):
-            raise Deny("path-qualified command %r" % cmd)
+            raise Deny("path-qualified command %r", cmd)
         cmd = cmd.rsplit("/", 1)[1]
 
     if cmd in WRAPPERS:
@@ -753,7 +767,7 @@ def validate_command(words, depth=0):
         if cmd == "timeout" and rest:
             rest = rest[1:]  # duration argument
         if not rest:
-            raise Deny("%s without a command" % cmd)
+            raise Deny("%s without a command", cmd)
         return validate_command(rest, depth + 1)
 
     if cmd in GLOB_SENSITIVE:
@@ -768,7 +782,7 @@ def validate_command(words, depth=0):
         SEEN_COMMANDS.append(cmd)
         return
 
-    raise Deny("command not on read-only allowlist: %r" % cmd)
+    raise Deny("command not on read-only allowlist: %r", cmd)
 
 
 SEPARATORS = {";", ";;", "&&", "||", "|", "&", "(", ")", "\n"}
@@ -813,18 +827,23 @@ def explain(command):
     the difference between a log you can triage and a pile of shell lines.
     """
     if not command or not command.strip():
-        return "empty command"
+        return {"rule": "empty command", "detail": None,
+                "reason": "empty command"}
     del SEEN_COMMANDS[:]
     try:
         validate_line(command)
         check_whole_line()
         return None
     except Deny as exc:
-        return str(exc) or "denied"
+        return {"rule": exc.rule or "denied", "detail": exc.detail,
+                "reason": str(exc) or "denied"}
     except RecursionError:
-        return "nesting too deep"
+        return {"rule": "nesting too deep", "detail": None,
+                "reason": "nesting too deep"}
     except Exception as exc:
-        return "parse error: %s" % type(exc).__name__
+        name = type(exc).__name__
+        return {"rule": "parse error", "detail": name,
+                "reason": "parse error: %s" % name}
 
 
 def is_read_only(command):
@@ -833,11 +852,14 @@ def is_read_only(command):
 
 # ------------------------------------------------------------- denial log
 
-# Commands that were not auto-allowed are appended here so the allowlist can
-# be widened from evidence instead of guesswork. Set PLAN_MODE_AUTOALLOW_LOG
-# to another path, or to "off" to disable.
+# Commands that were not auto-allowed are appended here so the allowlist can be
+# widened from evidence instead of guesswork. The log lives in its own directory
+# rather than loose in ~/.claude: the rotated file is a second entry, and the
+# directory gives the README a place to sit, so someone who finds the log
+# without knowing the hook can work out what wrote it and how to read it.
 LOG_ENV = "PLAN_MODE_AUTOALLOW_LOG"
-LOG_BASENAME = "plan-mode-autoallow-denied.jsonl"
+LOG_DIRNAME = "plan-mode-autoallow"
+LOG_BASENAME = "denied.jsonl"
 LOG_MAX_BYTES = 2 * 1024 * 1024
 LOG_OFF = {"", "off", "0", "no", "false", "none"}
 
@@ -854,15 +876,20 @@ def log_path():
     base = os.environ.get("CLAUDE_CONFIG_DIR")
     if not base:
         base = os.path.join(os.path.expanduser("~"), ".claude")
-    return os.path.join(base, LOG_BASENAME)
+    return os.path.join(base, LOG_DIRNAME, LOG_BASENAME)
 
 
-def log_denial(command, reason, cwd=None):
+def log_denial(command, verdict, cwd=None):
     """Append one JSON line. Never raises -- logging must not gate a decision.
 
     Imports live in the function body: this runs only when a command was
     rejected, and the hook's cost is dominated by module import on the path
     that matters (a command that gets allowed).
+
+    `rule` and `detail` are what make the file a dataset rather than a pile of
+    sentences -- see report(). `reason` is kept alongside them because the first
+    way anyone reads this file is `tail`, and a sentence survives that better
+    than two fields the reader has to recombine.
     """
     try:
         import os
@@ -871,6 +898,9 @@ def log_denial(command, reason, cwd=None):
         path = log_path()
         if not path:
             return
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, mode=0o700, exist_ok=True)
         # Rotate rather than truncate, so a burst of denials cannot discard the
         # very entries that motivated looking at the file.
         try:
@@ -880,7 +910,9 @@ def log_denial(command, reason, cwd=None):
             pass
         record = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "reason": reason,
+            "rule": verdict["rule"],
+            "detail": verdict["detail"],
+            "reason": verdict["reason"],
             "command": command,
         }
         if isinstance(cwd, str) and cwd:
@@ -897,46 +929,67 @@ def log_denial(command, reason, cwd=None):
         pass
 
 
+def load_log(path):
+    """Records from the log and its rotated predecessor, oldest first."""
+    records = []
+    for candidate in (path + ".1", path):
+        try:
+            with open(candidate, encoding="utf-8") as fh:
+                lines = fh.readlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                records.append(json.loads(line))
+            except ValueError:
+                continue
+    return records
+
+
 def report(path=None):
-    """Summarise the denial log: which rules fire, and on what."""
+    """Summarise the denial log: which rules fire, and on what.
+
+    Grouped by `rule` rather than `reason`, because a rule that embeds a value
+    -- "output redirection to 'a.txt'" -- would otherwise land in a bucket of
+    one and never rise to the top of the list, which is the whole reason to
+    read this file.
+    """
     path = path or log_path()
     if not path:
         print("logging is disabled (%s)" % LOG_ENV)
         return 1
-    try:
-        with open(path, encoding="utf-8") as fh:
-            lines = fh.readlines()
-    except OSError as exc:
-        print("cannot read %s: %s" % (path, exc))
-        return 1
-
-    by_reason = {}
-    by_command = {}
-    for line in lines:
-        try:
-            record = json.loads(line)
-        except ValueError:
-            continue
-        reason = record.get("reason", "?")
-        command = record.get("command", "")
-        by_reason[reason] = by_reason.get(reason, 0) + 1
-        by_command[command] = by_command.get(command, 0) + 1
-
-    if not by_command:
+    records = load_log(path)
+    if not records:
         print("%s: no entries" % path)
         return 0
 
-    print("%s -- %d denials, %d distinct commands\n"
-          % (path, sum(by_reason.values()), len(by_command)))
-    print("by reason:")
-    for reason, count in sorted(by_reason.items(), key=lambda kv: -kv[1]):
-        print("  %5d  %s" % (count, reason))
-    print("\nmost frequent commands:")
-    for command, count in sorted(by_command.items(), key=lambda kv: -kv[1])[:20]:
-        flat = " ".join(command.split())
-        if len(flat) > 100:
-            flat = flat[:97] + "..."
-        print("  %5d  %s" % (count, flat))
+    by_rule = {}
+    for record in records:
+        # Records written before rules were split carry only a reason.
+        rule = record.get("rule") or record.get("reason", "?")
+        detail = record.get("detail")
+        counts = by_rule.setdefault(rule, {})
+        counts[detail] = counts.get(detail, 0) + 1
+
+    print("%s\n%d denials, %d rules, %s .. %s\n"
+          % (path, len(records), len(by_rule),
+             records[0].get("ts", "?"), records[-1].get("ts", "?")))
+    for rule, details in sorted(by_rule.items(),
+                                key=lambda kv: -sum(kv[1].values())):
+        top = sorted((d for d in details.items() if d[0]), key=lambda kv: -kv[1])
+        shown = "  ".join("%s×%d" % (d, c) for d, c in top[:6])
+        if len(top) > 6:
+            shown += "  (+%d more)" % (len(top) - 6)
+        print("%5d  %s" % (sum(details.values()), rule))
+        if shown:
+            print("       %s" % shown)
+
+    print("\nlast %d commands:" % min(10, len(records)))
+    for record in records[-10:]:
+        flat = " ".join(record.get("command", "").split())
+        if len(flat) > 88:
+            flat = flat[:85] + "..."
+        print("  %s  %s" % (record.get("ts", "?")[:16], flat))
     return 0
 
 
@@ -950,8 +1003,8 @@ def main():
     command = (payload.get("tool_input") or {}).get("command")
     if not isinstance(command, str):
         return
-    reason = explain(command)
-    if reason is None:
+    verdict = explain(command)
+    if verdict is None:
         print(json.dumps({
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
@@ -960,7 +1013,7 @@ def main():
             }
         }))
         return
-    log_denial(command, reason, payload.get("cwd"))
+    log_denial(command, verdict, payload.get("cwd"))
 
 
 if __name__ == "__main__":
