@@ -1,0 +1,90 @@
+{
+  "_comment": "Merge these keys into ~/.claude/settings.json. The hooks block is required; the permissions block is optional but recommended -- it cuts prompts in normal mode too, and the deny entries keep credential files unreadable. Note that awk/find/sort/fd/tree/uniq are deliberately absent from allow: as prefix rules they would also permit 'find . -delete', 'sort -o victim', 'awk BEGIN{system(...)}'. In plan mode the hook allows their safe forms after checking arguments.",
+
+  "permissions": {
+    "allow": [
+      "Read(//**)",
+      "Glob",
+      "Grep",
+      "WebSearch",
+      "WebFetch",
+      "TodoWrite",
+      "NotebookRead",
+      "Bash(ls:*)",
+      "Bash(cat:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(wc:*)",
+      "Bash(grep:*)",
+      "Bash(rg:*)",
+      "Bash(file:*)",
+      "Bash(stat:*)",
+      "Bash(du:*)",
+      "Bash(df:*)",
+      "Bash(diff:*)",
+      "Bash(cut:*)",
+      "Bash(jq:*)",
+      "Bash(cd:*)",
+      "Bash(printf:*)",
+      "Bash(seq:*)",
+      "Bash(nl:*)",
+      "Bash(tac:*)",
+      "Bash(rev:*)",
+      "Bash(comm:*)",
+      "Bash(join:*)",
+      "Bash(paste:*)",
+      "Bash(column:*)",
+      "Bash(which:*)",
+      "Bash(type:*)",
+      "Bash(env)",
+      "Bash(date:*)",
+      "Bash(pwd)",
+      "Bash(basename:*)",
+      "Bash(dirname:*)",
+      "Bash(realpath:*)",
+      "Bash(readlink:*)",
+      "Bash(echo:*)",
+      "Bash(git status:*)",
+      "Bash(git log:*)",
+      "Bash(git diff:*)",
+      "Bash(git show:*)",
+      "Bash(git rev-parse:*)",
+      "Bash(git ls-files:*)",
+      "Bash(git blame:*)"
+    ],
+    "deny": [
+      "Read(//**/.env)",
+      "Read(//**/.env.*)",
+      "Read(//**/*.pem)",
+      "Read(//**/*.key)",
+      "Read(//**/.ssh/**)",
+      "Read(//**/id_rsa*)",
+      "Read(//**/*.p12)",
+      "Read(//**/*.jks)",
+      "Read(//**/*.keystore)",
+      "Read(//**/.aws/**)",
+      "Read(//**/.config/gh/**)",
+      "Read(//**/.config/gcloud/**)",
+      "Read(//**/.kube/**)",
+      "Read(//**/.gnupg/**)",
+      "Read(//**/.docker/config.json)",
+      "Read(//**/.npmrc)",
+      "Read(//**/.netrc)",
+      "Read(//**/.pypirc)"
+    ]
+  },
+
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$HOME/.claude/hooks/plan-mode-autoallow.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}
