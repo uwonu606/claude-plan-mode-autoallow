@@ -94,17 +94,45 @@ cd claude-plan-mode-autoallow
 
 `settings.example.json` also contains a `permissions.allow` / `permissions.deny` block worth reading: the allow entries cut prompts in *normal* mode too, and the deny entries keep credential files unreadable.
 
+## Denial log
+
+Default deny means the allowlist is never finished — there is always some read-only command it has not seen. So every plan-mode Bash command the parser rejects is appended to `~/.claude/plan-mode-autoallow-denied.jsonl`, together with the rule that rejected it:
+
+```json
+{"ts":"2026-07-26T17:48:59+0900","reason":"command not on read-only allowlist: 'rm'","command":"rm -rf /tmp/x","cwd":"/srv/project"}
+```
+
+The reason is the point. A log of bare shell lines tells you *that* something prompted; the reason tells you *which rule* to argue with, which is what you need to decide between widening the allowlist, loosening an argument check, and leaving it alone.
+
+To triage:
+
+```sh
+python3 hooks/readonly_cmd.py --report
+```
+
+It groups by reason and lists the most frequent commands, so a rule that fires twenty times a day is visible next to one that has never fired.
+
+| | |
+|---|---|
+| Path | `PLAN_MODE_AUTOALLOW_LOG=/some/path`, or `off` to disable. Defaults under `CLAUDE_CONFIG_DIR` when that is set. |
+| Rotation | At 2 MB the file is renamed `.jsonl.1` and a new one starts, so a burst cannot discard the entries that prompted you to look. |
+| Permissions | Created `0600`. It holds whole command lines, so treat it as you would shell history. |
+| Failures | A log that cannot be written is ignored — it never changes or blocks a permission decision. |
+
+One caveat when reading it: a logged command did not necessarily raise a prompt. The hook staying silent hands the decision back to the normal flow, where a `permissions.allow` rule may still have covered it. The log is the set of commands *this parser* declined, which is the set worth reviewing.
+
 ## Cost
 
-Measured on WSL2, 50 iterations each:
+Measured on WSL2, 30 iterations each:
 
 | Path | Per call |
 |---|---|
 | Any non-plan mode | 1.1 ms |
-| Plan mode, non-Bash tool | 1.1 ms |
-| Plan mode, Bash | ~20 ms |
+| Plan mode, non-Bash tool | 1.0 ms |
+| Plan mode, Bash, allowed | ~14 ms |
+| Plan mode, Bash, denied | ~15 ms |
 
-The bash half spawns no subprocesses; `python3` starts only for Bash calls made in plan mode.
+The bash half spawns no subprocesses; `python3` starts only for Bash calls made in plan mode. The denied path costs one extra append, and the modules it needs are imported inside the logging function so the allowed path does not pay for them.
 
 ## Tests
 
@@ -112,7 +140,7 @@ The bash half spawns no subprocesses; `python3` starts only for Bash calls made 
 python3 tests/test_readonly_cmd.py
 ```
 
-222 cases covering the allow set, the escape techniques above, and regressions. Two bugs found by this suite, both of which wrongly *allowed* commands:
+241 cases covering the allow set, the escape techniques above, the denial log, and regressions. Two bugs found by this suite, both of which wrongly *allowed* commands:
 
 - `printf ... | exec python3 ...` — `exec` inside a pipeline replaces the subshell, not the script, so the script continued to the blanket-allow line and approved `rm -rf`.
 - The tokenizer checked `isspace()` before operator matching, so a newline was swallowed as whitespace and `ls\nrm -rf /tmp/x` parsed as `ls` with `rm` as an argument.

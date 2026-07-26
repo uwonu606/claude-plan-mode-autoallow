@@ -805,20 +805,139 @@ def check_whole_line():
         raise Deny("cd before git can execute hooks from the target directory")
 
 
-def is_read_only(command):
+def explain(command):
+    """None when the whole line is read-only, otherwise why it was rejected.
+
+    The reason is what makes the denial log worth keeping: it turns "this
+    prompted" into "this prompted because `sed -i` writes in place", which is
+    the difference between a log you can triage and a pile of shell lines.
+    """
     if not command or not command.strip():
-        return False
+        return "empty command"
     del SEEN_COMMANDS[:]
     try:
         validate_line(command)
         check_whole_line()
-        return True
-    except Deny:
-        return False
+        return None
+    except Deny as exc:
+        return str(exc) or "denied"
     except RecursionError:
-        return False
+        return "nesting too deep"
+    except Exception as exc:
+        return "parse error: %s" % type(exc).__name__
+
+
+def is_read_only(command):
+    return explain(command) is None
+
+
+# ------------------------------------------------------------- denial log
+
+# Commands that were not auto-allowed are appended here so the allowlist can
+# be widened from evidence instead of guesswork. Set PLAN_MODE_AUTOALLOW_LOG
+# to another path, or to "off" to disable.
+LOG_ENV = "PLAN_MODE_AUTOALLOW_LOG"
+LOG_BASENAME = "plan-mode-autoallow-denied.jsonl"
+LOG_MAX_BYTES = 2 * 1024 * 1024
+LOG_OFF = {"", "off", "0", "no", "false", "none"}
+
+
+def log_path():
+    """Where to append denials, or None when logging is switched off."""
+    import os
+
+    configured = os.environ.get(LOG_ENV)
+    if configured is not None:
+        if configured.strip().lower() in LOG_OFF:
+            return None
+        return os.path.expanduser(configured)
+    base = os.environ.get("CLAUDE_CONFIG_DIR")
+    if not base:
+        base = os.path.join(os.path.expanduser("~"), ".claude")
+    return os.path.join(base, LOG_BASENAME)
+
+
+def log_denial(command, reason, cwd=None):
+    """Append one JSON line. Never raises -- logging must not gate a decision.
+
+    Imports live in the function body: this runs only when a command was
+    rejected, and the hook's cost is dominated by module import on the path
+    that matters (a command that gets allowed).
+    """
+    try:
+        import os
+        import time
+
+        path = log_path()
+        if not path:
+            return
+        # Rotate rather than truncate, so a burst of denials cannot discard the
+        # very entries that motivated looking at the file.
+        try:
+            if os.path.getsize(path) > LOG_MAX_BYTES:
+                os.replace(path, path + ".1")
+        except OSError:
+            pass
+        record = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "reason": reason,
+            "command": command,
+        }
+        if isinstance(cwd, str) and cwd:
+            record["cwd"] = cwd
+        line = json.dumps(record, ensure_ascii=False) + "\n"
+        # O_APPEND keeps concurrent hook processes from interleaving, and the
+        # mode matters because command lines can carry anything the agent typed.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, line.encode("utf-8"))
+        finally:
+            os.close(fd)
     except Exception:
-        return False
+        pass
+
+
+def report(path=None):
+    """Summarise the denial log: which rules fire, and on what."""
+    path = path or log_path()
+    if not path:
+        print("logging is disabled (%s)" % LOG_ENV)
+        return 1
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except OSError as exc:
+        print("cannot read %s: %s" % (path, exc))
+        return 1
+
+    by_reason = {}
+    by_command = {}
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        reason = record.get("reason", "?")
+        command = record.get("command", "")
+        by_reason[reason] = by_reason.get(reason, 0) + 1
+        by_command[command] = by_command.get(command, 0) + 1
+
+    if not by_command:
+        print("%s: no entries" % path)
+        return 0
+
+    print("%s -- %d denials, %d distinct commands\n"
+          % (path, sum(by_reason.values()), len(by_command)))
+    print("by reason:")
+    for reason, count in sorted(by_reason.items(), key=lambda kv: -kv[1]):
+        print("  %5d  %s" % (count, reason))
+    print("\nmost frequent commands:")
+    for command, count in sorted(by_command.items(), key=lambda kv: -kv[1])[:20]:
+        flat = " ".join(command.split())
+        if len(flat) > 100:
+            flat = flat[:97] + "..."
+        print("  %5d  %s" % (count, flat))
+    return 0
 
 
 # ---------------------------------------------------------------- entrypoint
@@ -831,7 +950,8 @@ def main():
     command = (payload.get("tool_input") or {}).get("command")
     if not isinstance(command, str):
         return
-    if is_read_only(command):
+    reason = explain(command)
+    if reason is None:
         print(json.dumps({
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
@@ -839,7 +959,11 @@ def main():
                 "permissionDecisionReason": "plan mode: read-only command",
             }
         }))
+        return
+    log_denial(command, reason, payload.get("cwd"))
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--report":
+        sys.exit(report(sys.argv[2] if len(sys.argv) > 2 else None))
     main()

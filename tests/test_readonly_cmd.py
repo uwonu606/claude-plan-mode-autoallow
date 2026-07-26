@@ -282,7 +282,121 @@ for _cmd, _want in GH:
         gh_fail += 1
 print("gh: %d/%d passed" % (len(GH) - gh_fail, len(GH)))
 
-total = len(ALLOW) + len(DENY) + len(EXTRA) + len(HARDENING) + len(GH)
-total_fail = fails + extra_fail + hard_fail + gh_fail
+# ------------------------------------------------------------------ log
+
+import io
+import json as _json
+import tempfile
+
+import readonly_cmd
+
+
+def run_main(command, cwd=None):
+    """Drive main() the way the hook does and return what it printed."""
+    payload = {"permission_mode": "plan", "tool_name": "Bash",
+               "tool_input": {"command": command}}
+    if cwd:
+        payload["cwd"] = cwd
+    stdin, stdout = sys.stdin, sys.stdout
+    sys.stdin, sys.stdout = io.StringIO(_json.dumps(payload)), io.StringIO()
+    try:
+        readonly_cmd.main()
+        return sys.stdout.getvalue()
+    finally:
+        sys.stdin, sys.stdout = stdin, stdout
+
+
+def read_log(path):
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8") as fh:
+        return [_json.loads(l) for l in fh if l.strip()]
+
+
+log_checks = []
+
+
+def log_check(name, ok):
+    log_checks.append((name, bool(ok)))
+
+
+_saved_env = os.environ.get("PLAN_MODE_AUTOALLOW_LOG")
+_tmp = tempfile.mkdtemp(prefix="autoallow-log-")
+try:
+    logfile = os.path.join(_tmp, "denied.jsonl")
+    os.environ["PLAN_MODE_AUTOALLOW_LOG"] = logfile
+
+    out = run_main("rm -rf /tmp/x", cwd="/srv/project")
+    rows = read_log(logfile)
+    log_check("denial is logged", len(rows) == 1)
+    log_check("denial logs the command",
+              rows and rows[0].get("command") == "rm -rf /tmp/x")
+    log_check("denial logs a reason", rows and rows[0].get("reason"))
+    log_check("denial logs cwd", rows and rows[0].get("cwd") == "/srv/project")
+    log_check("denial prints no decision", out == "")
+    log_check("log file is not world-readable",
+              (os.stat(logfile).st_mode & 0o077) == 0)
+
+    out = run_main("ls -la")
+    log_check("allowed command prints allow", '"allow"' in out)
+    log_check("allowed command is not logged", len(read_log(logfile)) == 1)
+
+    os.environ["PLAN_MODE_AUTOALLOW_LOG"] = "off"
+    run_main("rm -rf /tmp/y")
+    log_check("logging honours off switch", len(read_log(logfile)) == 1)
+    log_check("off switch reported by log_path", readonly_cmd.log_path() is None)
+
+    # Rotation keeps the recent entries and moves the old file aside.
+    os.environ["PLAN_MODE_AUTOALLOW_LOG"] = logfile
+    with open(logfile, "w", encoding="utf-8") as fh:
+        fh.write("x" * (readonly_cmd.LOG_MAX_BYTES + 1))
+    run_main("sed -i s/a/b/ f")
+    log_check("oversized log rotates", os.path.exists(logfile + ".1"))
+    log_check("rotated log restarts", len(read_log(logfile)) == 1)
+
+    # A log that cannot be written must not change the decision or raise.
+    os.environ["PLAN_MODE_AUTOALLOW_LOG"] = os.path.join(_tmp, "nope", "d.jsonl")
+    log_check("unwritable log stays silent on deny", run_main("rm -rf /tmp/z") == "")
+    log_check("unwritable log still allows", '"allow"' in run_main("ls"))
+
+    # explain() is what makes the log triageable.
+    log_check("explain returns None when allowed",
+              readonly_cmd.explain("ls -la") is None)
+    log_check("explain names the sed rule",
+              "sed" in (readonly_cmd.explain("sed -i s/a/b/ f") or "").lower())
+    log_check("explain names the cd/git rule",
+              "cd" in (readonly_cmd.explain("cd /x && git log") or "").lower())
+
+    # --report must survive a log containing a malformed line.
+    os.environ["PLAN_MODE_AUTOALLOW_LOG"] = logfile
+    with open(logfile, "a", encoding="utf-8") as fh:
+        fh.write("not json\n")
+    stdout = sys.stdout
+    sys.stdout = io.StringIO()
+    try:
+        rc = readonly_cmd.report()
+        text = sys.stdout.getvalue()
+    finally:
+        sys.stdout = stdout
+    log_check("report succeeds", rc == 0)
+    log_check("report counts denials", "1 denials" in text or "denials" in text)
+finally:
+    if _saved_env is None:
+        os.environ.pop("PLAN_MODE_AUTOALLOW_LOG", None)
+    else:
+        os.environ["PLAN_MODE_AUTOALLOW_LOG"] = _saved_env
+    import shutil
+    shutil.rmtree(_tmp, ignore_errors=True)
+
+log_fail = 0
+for _name, _ok in log_checks:
+    if not _ok:
+        print("FAIL (log): %s" % _name)
+        log_fail += 1
+print("log: %d/%d passed" % (len(log_checks) - log_fail, len(log_checks)))
+
+total = (len(ALLOW) + len(DENY) + len(EXTRA) + len(HARDENING) + len(GH)
+         + len(log_checks))
+total_fail = fails + extra_fail + hard_fail + gh_fail + log_fail
 print("TOTAL: %d/%d passed" % (total - total_fail, total))
 sys.exit(1 if total_fail else 0)
