@@ -147,6 +147,29 @@ allow 집합, 위에 적은 우회 기법들, 거부 로그, 그리고 회귀를
 
 allowlist를 넓힐 때는 양방향으로 케이스를 추가할 것.
 
+## 실세션 검증
+
+훅의 판정은 JSON을 손으로 파이프해서 전부 확인할 수 있지만, 그것만으로는 정작 중요한 질문에 답하지 못한다. 라이브 페이로드에 `permission_mode` 필드가 실제로 오는가? Claude Code가 훅의 `allow` 결정을 실제로 존중하는가? 아래는 실제 세션에서 확인한 것들이다. 환경은 Claude Code 2.1.220, WSL2, 2026-07-26.
+
+**훅은 실제로 발화한다.** plan mode에서 `for i in 1 2 3; do echo "tick $i"; done`이 프롬프트 없이 통과했다. `for`로 시작하는 줄은 어떤 프리픽스 규칙으로도 매칭되지 않고 내장 `isReadOnly` 검사는 복합 명령을 거부하므로, 이 줄을 통과시킬 수 있는 주체는 훅밖에 없다. `permission_mode` 필드가 페이로드에 존재한다는 것과 CLI가 훅의 `allow`를 존중한다는 것이 이 한 건으로 동시에 확인된다.
+
+**거부 쪽도 실제로 막힌다.** plan mode에서 시도한 아래 두 명령 모두 권한 프롬프트가 떴고, 거부 로그에 이유가 남았다:
+
+| 시도한 명령 | 로그에 기록된 이유 |
+|---|---|
+| `echo "hello" > /tmp/perm_test.txt` | `output redirection to '/tmp/perm_test.txt'` |
+| `gh api -X POST repos/…/issues -f title=probe` | `gh api -X POST` |
+
+**`permissions.deny`가 훅의 `allow`를 이긴다.** 훅은 plan mode에서 비-Bash 도구를 전부 자동 승인하지만, `permissions.deny`에 걸린 자격증명 파일 읽기는 그대로 거부됐다. 자동 승인이 deny 규칙에 구멍을 내지는 않는다는 뜻이다.
+
+**`cd` 다음 `git`** 규칙도 이론이 아니다. 세션 중 `cd <dir> && git log …`가 실제로 프롬프트를 띄웠다.
+
+**plan mode 밖은 그대로다.** `default` 모드에서 `ls`는 프롬프트 없이 통과하고 `find`는 프롬프트가 뜬다 — `settings.example.json`에서 `Bash(find:*)`를 뺀 결과다. `find . -delete`가 무프롬프트로 도는 것보다 프롬프트 한 번이 낫다.
+
+같은 자리에서 `git -C <path> log`도 프롬프트가 떴다. `Bash(git log:*)` 규칙이 있는데도 그렇다. 추출된 프리픽스가 `git -C <path>`라 규칙과 어긋나기 때문이다. 프리픽스 규칙의 한계를 보여주는 사례가 하나 더 늘어난 셈인데, 같은 명령이 plan mode에서는 통과한다. 파서는 `-C`를 값을 받는 플래그로 알고 `log`를 서브커맨드로 읽는다.
+
+**auto 모드에서는 이 훅의 효과를 측정할 수 없다.** `auto`의 LLM 분류기가 `find` 같은 명령을 알아서 승인해버리기 때문에, 무엇이 통과하고 무엇이 막히는지가 훅과 무관하게 결정된다. 훅의 동작을 확인하려면 `plan`에서, 일반 모드 회귀를 확인하려면 `default`에서 봐야 한다. `auto`에서 본 결과는 어느 쪽 증거도 되지 못한다.
+
 ## 근거
 
 allowlist는 직관으로 쓰지 않고 세 출처와 대조했다. Claude Code 자신의 읽기 전용 집합(2.1.220 바이너리에서 추출), [OpenAI Codex CLI의 `is_safe_command.rs`](https://github.com/openai/codex/blob/main/codex-rs/shell-command/src/command_safety/is_safe_command.rs), 그리고 거꾸로 쓴 [GTFOBins](https://gtfobins.github.io/) — 무해해 보이지만 파일을 쓰거나 셸을 띄울 수 있는 명령의 목록으로. 위의 인자 검사는 대부분 원래 설계가 아니라 이 대조에서 나왔다.
