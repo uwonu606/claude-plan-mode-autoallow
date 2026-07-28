@@ -26,7 +26,7 @@ ALLOW = [
     "awk '{print $1}' file.txt",
     "timeout 30 grep -r foo .",
     "env",
-    "env FOO=bar ls",
+    "env LANG=C ls",
     "while read -r l; do echo x; done" if False else "ls | wc -l",
     "git status --short",
     "git config --get user.email",
@@ -193,6 +193,33 @@ HARDENING = [
     ("PATH=/tmp ls", False),
     ("LESSOPEN='|sh %s' cat f", False),
     ("IFS=x ls", False),
+    # `env` in front must not launder any of the above. It used to: the wrapper
+    # discarded assignments instead of checking them, so every vector on this
+    # list came back to life with four characters in front of it.
+    ("env PAGER='sh -c \"exec sh\"' git log", False),
+    ("env GIT_EXTERNAL_DIFF=/usr/bin/id git diff", False),
+    ("env GIT_SSH_COMMAND=id git ls-remote origin", False),
+    ("env GIT_PAGER=sh git log", False),
+    ("env LD_PRELOAD=/tmp/x.so ls", False),
+    ("env BASH_ENV=/tmp/x ls", False),
+    ("env FOO=bar ls", False),
+    # -S splits its operand into a command line, so the wrapped command never
+    # appears as a word of its own. Attached form only -- `env -S "sh -c id"`
+    # separates into a word that was already rejected as an unknown command.
+    ('env -S"touch pwned"', False),
+    ('env -S"sh -c id"', False),
+    ('env -vS"id"', False),
+    ('env --split-string="touch x"', False),
+    # -a renames argv[0], so the validated name is not the one that runs.
+    ("env -a foo /bin/sh", False),
+    ("env -C /tmp ls", False),
+    ("env -i ls", True),
+    ("env - ls", True),
+    ("env -u PATH ls", True),
+    ("env -uPATH ls", True),
+    ("env --unset=PATH ls", True),
+    ("env LANG=C ls", True),
+    ("env LC_ALL=C sort file", True),
     ("LC_ALL=C sort file", True),
     ("LANG=C grep foo f", True),
     ("TZ=UTC date", True),

@@ -133,6 +133,15 @@ ENV_PREFIX_OK = {
     "CLICOLOR", "CLICOLOR_FORCE", "GREP_COLORS", "GREP_COLOR",
 }
 
+# `env` flags are allowlisted rather than denylisted, because the dangerous ones
+# do not look dangerous: `-S` splits its operand into a whole command line
+# (`env -S"touch x"` runs touch), and `-a` renames argv[0] so the command that
+# gets validated is not the one that runs. A denylist has to know both in
+# advance; this way an unrecognized flag is simply refused.
+ENV_FLAGS_OK = {"-", "-i", "--ignore-environment", "-0", "--null",
+                "-v", "--debug", "--help", "--version"}
+ENV_FLAGS_WITH_VALUE = {"-u", "--unset"}
+
 SUBST_PLACEHOLDER = "\x00SUBST\x00"
 
 # Command names accepted while validating the current line, for the
@@ -418,6 +427,20 @@ def unquote(word):
     if len(word) >= 2 and word[0] == word[-1] and word[0] in "\"'":
         return word[1:-1]
     return word
+
+
+def check_assignment(word):
+    """Refuse a `VAR=value` prefix unless VAR only affects locale or formatting.
+
+    Shared by the two places an assignment can precede a command -- bare
+    `VAR=value cmd` and `env VAR=value cmd`. They must agree: the whole point of
+    the restriction is that variables like PAGER and GIT_EXTERNAL_DIFF name a
+    program the command will execute, and `env` in front changes nothing about
+    that.
+    """
+    name = word.split("=", 1)[0]
+    if name not in ENV_PREFIX_OK and not name.startswith("LC_"):
+        raise Deny("%s= prefixes a command", name)
 
 
 def check_find(args):
@@ -730,9 +753,7 @@ def validate_command(words, depth=0):
 
     # Assignments that prefix a command run that command with the variable set.
     for a in assignments:
-        name = a.split("=", 1)[0]
-        if name not in ENV_PREFIX_OK and not name.startswith("LC_"):
-            raise Deny("%s= prefixes a command", name)
+        check_assignment(a)
 
     cmd = unquote(words[0])
     args = words[1:]
@@ -754,13 +775,29 @@ def validate_command(words, depth=0):
     if cmd in WRAPPERS:
         rest = list(args)
         if cmd == "env":
-            while rest and (rest[0].startswith("-") or is_assignment(rest[0])):
-                if rest[0] in ("-u", "--unset"):
-                    rest = rest[2:]
-                    continue
+            while rest:
+                word = rest[0]
+                if is_assignment(word):
+                    check_assignment(word)
+                elif word in ENV_FLAGS_WITH_VALUE:
+                    rest = rest[1:]  # the value is data, not a command
+                elif word in ENV_FLAGS_OK or word.startswith("--unset="):
+                    pass
+                elif word.startswith("-u") and len(word) > 2:
+                    pass  # -uNAME, the attached form of --unset
+                elif word.startswith("-"):
+                    raise Deny("env %s", word)
+                else:
+                    break  # first non-option word: the command being wrapped
                 rest = rest[1:]
+            # Reaching the end without a command means every word was an option
+            # or an assignment, so this run only prints the environment. That is
+            # read-only -- but only because each word above was recognized. The
+            # earlier version drew the same conclusion from an empty list it had
+            # emptied by discarding unrecognized flags, which is how `env -S`
+            # passed as if it were a bare `env`.
             if not rest:
-                return  # plain `env` dumps the environment
+                return
             return validate_command(rest, depth + 1)
         while rest and rest[0].startswith("-"):
             rest = rest[1:]
