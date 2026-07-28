@@ -58,6 +58,48 @@ GIT_BRANCH_MUTATE = {"-d", "-D", "-m", "-M", "-c", "-C", "-f", "--delete",
 FIND_BAD = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fls",
             "-files0-from"}
 
+# `sort`, `file` and `awk` are screened by listing the flags that are allowed
+# rather than the ones that are not. All three were picked for that treatment by
+# being caught: `file -C` writes magic.mgc, `sort --compress-program=sh` runs a
+# program, and gawk writes files through -o/-p/-d and loads shared objects
+# through -l. None of those look like an action flag, which is what a denylist
+# needs them to look like. The tools whose dangerous surface really is a short
+# closed list -- find's actions, rg's --pre, fd's --exec -- keep their denylists
+# below; an allowlist there would mean enumerating fifty harmless predicates and
+# refusing every one that got left out.
+SORT_FLAGS_OK = {
+    "-b", "-d", "-f", "-g", "-i", "-M", "-h", "-n", "-R", "-r", "-s", "-u",
+    "-z", "-c", "-C", "-m", "--ignore-leading-blanks", "--dictionary-order",
+    "--ignore-case", "--general-numeric-sort", "--ignore-nonprinting",
+    "--month-sort", "--human-numeric-sort", "--numeric-sort", "--random-sort",
+    "--reverse", "--stable", "--unique", "--zero-terminated", "--check",
+    "--merge", "--debug", "--help", "--version",
+}
+SORT_FLAGS_WITH_VALUE = {
+    "-k", "--key", "-t", "--field-separator", "-T", "--temporary-directory",
+    "-S", "--buffer-size", "--parallel", "--batch-size", "--files0-from",
+    "--random-source", "--sort",
+}
+
+FILE_FLAGS_OK = {
+    "-b", "--brief", "-c", "--checking-printout", "--exclude-quiet",
+    "-i", "--mime", "--mime-encoding", "--mime-type", "--apple", "--extension",
+    "-k", "--keep-going", "-l", "--list", "-L", "--dereference",
+    "-h", "--no-dereference", "-n", "--no-buffer", "-N", "--no-pad",
+    "-0", "--print0", "-p", "--preserve-date", "-r", "--raw",
+    "-s", "--special-files", "-d", "--debug", "-v", "--version", "--help",
+}
+FILE_FLAGS_WITH_VALUE = {"-e", "--exclude", "-F", "--separator",
+                         "-P", "--parameter"}
+
+# -S disables file(1)'s own seccomp sandbox and -z/-Z hand the payload to
+# external decompressors, so neither is listed above even though both read.
+AWK_FLAGS_OK = {"--posix", "--traditional", "-c", "--re-interval",
+                "-b", "--characters-as-bytes", "-S", "--sandbox",
+                "--help", "--version"}
+AWK_FLAGS_WITH_VALUE = {"-F", "--field-separator", "-v", "--assign"}
+AWK_PROGRAM_FLAGS = {"-e", "--source"}
+
 # jq can read arbitrary files and load modules: -f/--from-file, --rawfile,
 # --slurpfile, -L/--library-path, --run-tests, and `env`/`$ENV`/`include`/
 # `import` inside the program.
@@ -114,9 +156,6 @@ REDIR_OK_TARGETS = {"/dev/null", "/dev/stdout", "/dev/stderr"}
 
 # rg can execute a preprocessor binary and read archives through helpers.
 RG_BAD_FLAGS = {"--pre", "--pre-glob", "--hostname-bin", "-z", "--search-zip"}
-
-# file(1) opens attacker-named paths through these.
-FILE_BAD_FLAGS = {"-m", "--magic-file", "-f", "--files-from"}
 
 # Commands whose flags can write or execute. An unquoted glob next to one of
 # these is a hole: the glob can expand to a filename like `-delete` or
@@ -449,16 +488,69 @@ def check_find(args):
             raise Deny("find %s", a)
 
 
+def walk_flags(args, exact_ok, with_value, cmd, value_hook=None):
+    """Return the operands, refusing any flag that is not on the allowlist.
+
+    Short flags bundle (`sort -rn`) and carry their value attached (`awk -F:`),
+    so they are walked one character at a time rather than matched whole.
+    Bundling is why the allowlist has to be consulted per letter: `-bi` must not
+    be accepted just because neither `-b` nor `-i` is spelled out anywhere.
+
+    `value_hook` maps a flag to a function that inspects its value, for the ones
+    that carry something worth reading -- awk's `-e` takes a program.
+    """
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            return args[i + 1:]
+        if not a.startswith("-") or a == "-":
+            return args[i:]
+
+        if a.startswith("--"):
+            head, sep, value = a.partition("=")
+            if head in with_value:
+                if not sep:
+                    i += 1
+                    if i >= len(args):
+                        raise Deny(cmd + " %s without a value", head)
+                    value = args[i]
+            elif head in exact_ok:
+                i += 1
+                continue
+            else:
+                raise Deny(cmd + " %s", head)
+            if value_hook and head in value_hook:
+                value_hook[head](value)
+            i += 1
+            continue
+
+        j = 1
+        while j < len(a):
+            flag = "-" + a[j]
+            if flag in with_value:
+                value = a[j + 1:]
+                if not value:
+                    i += 1
+                    if i >= len(args):
+                        raise Deny(cmd + " %s without a value", flag)
+                    value = args[i]
+                if value_hook and flag in value_hook:
+                    value_hook[flag](value)
+                break  # the rest of the word was the value
+            if flag not in exact_ok:
+                raise Deny(cmd + " %s", flag)
+            j += 1
+        i += 1
+    return []
+
+
 def check_sort(args):
-    for a in args:
-        if a in ("-o", "--output") or a.startswith("--output="):
-            raise Deny("sort writes to a file")
-        if a.startswith("-o") and len(a) > 2 and not a.startswith("--"):
-            raise Deny("sort writes to a file")
+    walk_flags(args, SORT_FLAGS_OK, SORT_FLAGS_WITH_VALUE, "sort")
 
 
-def check_awk(args):
-    blob = " ".join(unquote(a) for a in args).lower()
+def check_awk_program(text):
+    blob = unquote(text).lower()
     for bad in AWK_BAD:
         if bad in blob:
             raise Deny("awk program contains %r", bad)
@@ -470,6 +562,29 @@ def check_awk(args):
                 continue
             raise Deny("awk program contains a redirection")
         i += 1
+
+
+def check_awk(args):
+    """Screen awk's flags, then its program text.
+
+    The flags have to come first. Screening the program was never enough on its
+    own: `-f prog.awk` takes the program from a file this parser cannot see, and
+    gawk's -o, -p and -d each write one, while -l loads a shared object. None of
+    those appear in AWK_FLAGS_OK, which is now the whole of why they are
+    refused.
+    """
+    from_flag = []
+
+    def screen(program):
+        from_flag.append(program)
+        check_awk_program(program)
+
+    operands = walk_flags(args, AWK_FLAGS_OK,
+                          AWK_FLAGS_WITH_VALUE | AWK_PROGRAM_FLAGS, "awk",
+                          dict.fromkeys(AWK_PROGRAM_FLAGS, screen))
+    # With -e the program came from the flag, so the first operand is a file.
+    if operands and not from_flag:
+        check_awk_program(operands[0])
 
 
 def check_sed(args):
@@ -568,11 +683,7 @@ def check_rg(args):
 
 
 def check_file(args):
-    for a in args:
-        if a in FILE_BAD_FLAGS or any(
-            a.startswith(f + "=") for f in FILE_BAD_FLAGS if f.startswith("--")
-        ):
-            raise Deny("file %s", a)
+    walk_flags(args, FILE_FLAGS_OK, FILE_FLAGS_WITH_VALUE, "file")
 
 
 def check_jq(args):
