@@ -22,10 +22,12 @@ import sys
 ALWAYS_OK = {
     "ls", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "rg", "fd",
     "tree", "file", "stat", "du", "df", "diff", "uniq", "cut", "jq", "which",
-    "type", "date", "pwd", "basename", "dirname", "realpath", "readlink",
+    "type", "pwd", "basename", "dirname", "realpath", "readlink",
     "echo", "printf", "true", "false", "test", "[", "[[", "seq", "column",
     "comm", "join", "paste", "nl", "tac", "rev", "md5sum", "sha256sum",
-    "cksum", "cd", "pushd", "popd", "hostname", "uname", "whoami", "id",
+    # `hostname` is absent on purpose: with an operand or -F it renames the
+    # host. Reading the name is already covered by `uname -n`.
+    "cksum", "cd", "pushd", "popd", "uname", "whoami", "id",
     "groups", "ps", "locale", "tty", "printenv", "wait", "sleep", "expr",
     # Present in Claude Code's own read-only set (extracted from the 2.1.220
     # binary) and absent here until now.
@@ -57,6 +59,60 @@ GIT_BRANCH_MUTATE = {"-d", "-D", "-m", "-M", "-c", "-C", "-f", "--delete",
 
 FIND_BAD = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fls",
             "-files0-from"}
+
+# `sort`, `file` and `awk` are screened by listing the flags that are allowed
+# rather than the ones that are not. All three were picked for that treatment by
+# being caught: `file -C` writes magic.mgc, `sort --compress-program=sh` runs a
+# program, and gawk writes files through -o/-p/-d and loads shared objects
+# through -l. None of those look like an action flag, which is what a denylist
+# needs them to look like. The tools whose dangerous surface really is a short
+# closed list -- find's actions, rg's --pre, fd's --exec -- keep their denylists
+# below; an allowlist there would mean enumerating fifty harmless predicates and
+# refusing every one that got left out.
+SORT_FLAGS_OK = {
+    "-b", "-d", "-f", "-g", "-i", "-M", "-h", "-n", "-R", "-r", "-s", "-u",
+    "-z", "-c", "-C", "-m", "--ignore-leading-blanks", "--dictionary-order",
+    "--ignore-case", "--general-numeric-sort", "--ignore-nonprinting",
+    "--month-sort", "--human-numeric-sort", "--numeric-sort", "--random-sort",
+    "--reverse", "--stable", "--unique", "--zero-terminated", "--check",
+    "--merge", "--debug", "--help", "--version",
+}
+SORT_FLAGS_WITH_VALUE = {
+    "-k", "--key", "-t", "--field-separator", "-T", "--temporary-directory",
+    "-S", "--buffer-size", "--parallel", "--batch-size", "--files0-from",
+    "--random-source", "--sort",
+}
+
+FILE_FLAGS_OK = {
+    "-b", "--brief", "-c", "--checking-printout", "--exclude-quiet",
+    "-i", "--mime", "--mime-encoding", "--mime-type", "--apple", "--extension",
+    "-k", "--keep-going", "-l", "--list", "-L", "--dereference",
+    "-h", "--no-dereference", "-n", "--no-buffer", "-N", "--no-pad",
+    "-0", "--print0", "-p", "--preserve-date", "-r", "--raw",
+    "-s", "--special-files", "-d", "--debug", "-v", "--version", "--help",
+}
+FILE_FLAGS_WITH_VALUE = {"-e", "--exclude", "-F", "--separator",
+                         "-P", "--parameter"}
+
+# -S disables file(1)'s own seccomp sandbox and -z/-Z hand the payload to
+# external decompressors, so neither is listed above even though both read.
+AWK_FLAGS_OK = {"--posix", "--traditional", "-c", "--re-interval",
+                "-b", "--characters-as-bytes", "-S", "--sandbox",
+                "--help", "--version"}
+AWK_FLAGS_WITH_VALUE = {"-F", "--field-separator", "-v", "--assign"}
+AWK_PROGRAM_FLAGS = {"-e", "--source"}
+
+# `date` needs an allowlist for a reason the other three do not share: on
+# BSD/macOS it takes the new clock value as a bare operand, with no flag at all
+# (`date 010100002026`). Refusing -s and --set only covers GNU. Everything date
+# prints goes through a `+FORMAT` operand, so anything else is a set.
+DATE_FLAGS_OK = {
+    "-u", "--utc", "--universal", "-R", "--rfc-email", "--iso-8601",
+    "--rfc-3339", "--debug", "--help", "--version",
+    "-I", "-Idate", "-Ihours", "-Iminutes", "-Iseconds", "-Ins",
+}
+DATE_FLAGS_WITH_VALUE = {"-d", "--date", "-f", "--file",
+                         "-r", "--reference"}
 
 # jq can read arbitrary files and load modules: -f/--from-file, --rawfile,
 # --slurpfile, -L/--library-path, --run-tests, and `env`/`$ENV`/`include`/
@@ -115,9 +171,6 @@ REDIR_OK_TARGETS = {"/dev/null", "/dev/stdout", "/dev/stderr"}
 # rg can execute a preprocessor binary and read archives through helpers.
 RG_BAD_FLAGS = {"--pre", "--pre-glob", "--hostname-bin", "-z", "--search-zip"}
 
-# file(1) opens attacker-named paths through these.
-FILE_BAD_FLAGS = {"-m", "--magic-file", "-f", "--files-from"}
-
 # Commands whose flags can write or execute. An unquoted glob next to one of
 # these is a hole: the glob can expand to a filename like `-delete` or
 # `--output=x`. Claude Code applies the same rule.
@@ -132,6 +185,15 @@ ENV_PREFIX_OK = {
     "LANG", "LANGUAGE", "TZ", "COLUMNS", "LINES", "TERM", "NO_COLOR",
     "CLICOLOR", "CLICOLOR_FORCE", "GREP_COLORS", "GREP_COLOR",
 }
+
+# `env` flags are allowlisted rather than denylisted, because the dangerous ones
+# do not look dangerous: `-S` splits its operand into a whole command line
+# (`env -S"touch x"` runs touch), and `-a` renames argv[0] so the command that
+# gets validated is not the one that runs. A denylist has to know both in
+# advance; this way an unrecognized flag is simply refused.
+ENV_FLAGS_OK = {"-", "-i", "--ignore-environment", "-0", "--null",
+                "-v", "--debug", "--help", "--version"}
+ENV_FLAGS_WITH_VALUE = {"-u", "--unset"}
 
 SUBST_PLACEHOLDER = "\x00SUBST\x00"
 
@@ -420,22 +482,103 @@ def unquote(word):
     return word
 
 
+def check_assignment(word):
+    """Refuse a `VAR=value` prefix unless VAR only affects locale or formatting.
+
+    Shared by the two places an assignment can precede a command -- bare
+    `VAR=value cmd` and `env VAR=value cmd`. They must agree: the whole point of
+    the restriction is that variables like PAGER and GIT_EXTERNAL_DIFF name a
+    program the command will execute, and `env` in front changes nothing about
+    that.
+    """
+    name = word.split("=", 1)[0]
+    if name not in ENV_PREFIX_OK and not name.startswith("LC_"):
+        raise Deny("%s= prefixes a command", name)
+
+
 def check_find(args):
     for a in args:
         if a in FIND_BAD or a.startswith("-fprint"):
             raise Deny("find %s", a)
 
 
+def walk_flags(args, exact_ok, with_value, cmd, value_hook=None):
+    """Return the operands, refusing any flag that is not on the allowlist.
+
+    Short flags bundle (`sort -rn`) and carry their value attached (`awk -F:`),
+    so they are walked one character at a time rather than matched whole.
+    Bundling is why the allowlist has to be consulted per letter: `-bi` must not
+    be accepted just because neither `-b` nor `-i` is spelled out anywhere.
+
+    `value_hook` maps a flag to a function that inspects its value, for the ones
+    that carry something worth reading -- awk's `-e` takes a program.
+    """
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            return args[i + 1:]
+        if not a.startswith("-") or a == "-":
+            return args[i:]
+
+        if a.startswith("--"):
+            head, sep, value = a.partition("=")
+            if head in with_value:
+                if not sep:
+                    i += 1
+                    if i >= len(args):
+                        raise Deny(cmd + " %s without a value", head)
+                    value = args[i]
+            elif head in exact_ok:
+                i += 1
+                continue
+            else:
+                raise Deny(cmd + " %s", head)
+            if value_hook and head in value_hook:
+                value_hook[head](value)
+            i += 1
+            continue
+
+        # A short flag that carries an optional attached value can be spelled
+        # out whole (date's -Iseconds); bundles like -rn fall through to the
+        # per-character walk below.
+        if a in exact_ok:
+            i += 1
+            continue
+
+        j = 1
+        while j < len(a):
+            flag = "-" + a[j]
+            if flag in with_value:
+                value = a[j + 1:]
+                if not value:
+                    i += 1
+                    if i >= len(args):
+                        raise Deny(cmd + " %s without a value", flag)
+                    value = args[i]
+                if value_hook and flag in value_hook:
+                    value_hook[flag](value)
+                break  # the rest of the word was the value
+            if flag not in exact_ok:
+                raise Deny(cmd + " %s", flag)
+            j += 1
+        i += 1
+    return []
+
+
 def check_sort(args):
-    for a in args:
-        if a in ("-o", "--output") or a.startswith("--output="):
-            raise Deny("sort writes to a file")
-        if a.startswith("-o") and len(a) > 2 and not a.startswith("--"):
-            raise Deny("sort writes to a file")
+    walk_flags(args, SORT_FLAGS_OK, SORT_FLAGS_WITH_VALUE, "sort")
 
 
-def check_awk(args):
-    blob = " ".join(unquote(a) for a in args).lower()
+def check_date(args):
+    for operand in walk_flags(args, DATE_FLAGS_OK, DATE_FLAGS_WITH_VALUE,
+                              "date"):
+        if not operand.startswith("+"):
+            raise Deny("date sets the clock from %r", operand)
+
+
+def check_awk_program(text):
+    blob = unquote(text).lower()
     for bad in AWK_BAD:
         if bad in blob:
             raise Deny("awk program contains %r", bad)
@@ -447,6 +590,29 @@ def check_awk(args):
                 continue
             raise Deny("awk program contains a redirection")
         i += 1
+
+
+def check_awk(args):
+    """Screen awk's flags, then its program text.
+
+    The flags have to come first. Screening the program was never enough on its
+    own: `-f prog.awk` takes the program from a file this parser cannot see, and
+    gawk's -o, -p and -d each write one, while -l loads a shared object. None of
+    those appear in AWK_FLAGS_OK, which is now the whole of why they are
+    refused.
+    """
+    from_flag = []
+
+    def screen(program):
+        from_flag.append(program)
+        check_awk_program(program)
+
+    operands = walk_flags(args, AWK_FLAGS_OK,
+                          AWK_FLAGS_WITH_VALUE | AWK_PROGRAM_FLAGS, "awk",
+                          dict.fromkeys(AWK_PROGRAM_FLAGS, screen))
+    # With -e the program came from the flag, so the first operand is a file.
+    if operands and not from_flag:
+        check_awk_program(operands[0])
 
 
 def check_sed(args):
@@ -545,11 +711,7 @@ def check_rg(args):
 
 
 def check_file(args):
-    for a in args:
-        if a in FILE_BAD_FLAGS or any(
-            a.startswith(f + "=") for f in FILE_BAD_FLAGS if f.startswith("--")
-        ):
-            raise Deny("file %s", a)
+    walk_flags(args, FILE_FLAGS_OK, FILE_FLAGS_WITH_VALUE, "file")
 
 
 def check_jq(args):
@@ -699,6 +861,7 @@ def check_git(args):
 CHECKERS = {
     "find": check_find,
     "sort": check_sort,
+    "date": check_date,
     "awk": check_awk,
     "gawk": check_awk,
     "mawk": check_awk,
@@ -730,9 +893,7 @@ def validate_command(words, depth=0):
 
     # Assignments that prefix a command run that command with the variable set.
     for a in assignments:
-        name = a.split("=", 1)[0]
-        if name not in ENV_PREFIX_OK and not name.startswith("LC_"):
-            raise Deny("%s= prefixes a command", name)
+        check_assignment(a)
 
     cmd = unquote(words[0])
     args = words[1:]
@@ -749,18 +910,38 @@ def validate_command(words, depth=0):
     if "/" in cmd:
         if not (cmd.startswith("/usr/bin/") or cmd.startswith("/bin/")):
             raise Deny("path-qualified command %r", cmd)
+        # The prefix only means anything if the path stays under it. Without
+        # this, `/bin/../tmp/ls` is checked as `ls` and runs `/tmp/ls`.
+        if ".." in cmd.split("/"):
+            raise Deny("path-qualified command %r", cmd)
         cmd = cmd.rsplit("/", 1)[1]
 
     if cmd in WRAPPERS:
         rest = list(args)
         if cmd == "env":
-            while rest and (rest[0].startswith("-") or is_assignment(rest[0])):
-                if rest[0] in ("-u", "--unset"):
-                    rest = rest[2:]
-                    continue
+            while rest:
+                word = rest[0]
+                if is_assignment(word):
+                    check_assignment(word)
+                elif word in ENV_FLAGS_WITH_VALUE:
+                    rest = rest[1:]  # the value is data, not a command
+                elif word in ENV_FLAGS_OK or word.startswith("--unset="):
+                    pass
+                elif word.startswith("-u") and len(word) > 2:
+                    pass  # -uNAME, the attached form of --unset
+                elif word.startswith("-"):
+                    raise Deny("env %s", word)
+                else:
+                    break  # first non-option word: the command being wrapped
                 rest = rest[1:]
+            # Reaching the end without a command means every word was an option
+            # or an assignment, so this run only prints the environment. That is
+            # read-only -- but only because each word above was recognized. The
+            # earlier version drew the same conclusion from an empty list it had
+            # emptied by discarding unrecognized flags, which is how `env -S`
+            # passed as if it were a bare `env`.
             if not rest:
-                return  # plain `env` dumps the environment
+                return
             return validate_command(rest, depth + 1)
         while rest and rest[0].startswith("-"):
             rest = rest[1:]
@@ -819,8 +1000,12 @@ def check_whole_line():
         raise Deny("cd before git can execute hooks from the target directory")
 
 
-def explain(command):
+def explain(command, extra_allowed=None):
     """None when the whole line is read-only, otherwise why it was rejected.
+
+    `extra_allowed` adds one command name to the allowlist for this call only.
+    It exists so a name the LLM classifier vouched for can be re-checked against
+    every other rule rather than bypassing them.
 
     The reason is what makes the denial log worth keeping: it turns "this
     prompted" into "this prompted because `sed -i` writes in place", which is
@@ -830,6 +1015,9 @@ def explain(command):
         return {"rule": "empty command", "detail": None,
                 "reason": "empty command"}
     del SEEN_COMMANDS[:]
+    added = extra_allowed and extra_allowed not in ALWAYS_OK
+    if added:
+        ALWAYS_OK.add(extra_allowed)
     try:
         validate_line(command)
         check_whole_line()
@@ -844,10 +1032,217 @@ def explain(command):
         name = type(exc).__name__
         return {"rule": "parse error", "detail": name,
                 "reason": "parse error: %s" % name}
+    finally:
+        if added:
+            ALWAYS_OK.discard(extra_allowed)
 
 
 def is_read_only(command):
     return explain(command) is None
+
+
+# ------------------------------------------------------- LLM second opinion
+
+# The one denial that means "I have never heard of this command" rather than "I
+# know this shape and it writes". Only that one is worth a second opinion: the
+# others are the structural rules -- redirection, backticks, indirect execution
+# -- and those are the parser's whole job.
+UNKNOWN_COMMAND_RULE = "command not on read-only allowlist"
+
+LLM_ENV = "PLAN_MODE_AUTOALLOW_LLM"
+LLM_ON = {"1", "on", "yes", "true"}
+
+# Names that never reach the classifier, however it might vote. This is the list
+# that decides how far a wrong answer can travel, and it holds two kinds of name.
+#
+# Most exist only to change something, so "read-only" is not a judgement call
+# there, it is a wrong answer. The rest -- systemctl, ip, iptables, sysctl --
+# do have reading subcommands, and by the rule above they belong with docker and
+# kubectl, out where the classifier can vote on them. They are held back anyway,
+# because the two mistakes are not the same size: a needless prompt for
+# `systemctl status` costs a keystroke, and a wrong yes for `systemctl stop`
+# has nothing behind it. The parser re-run cannot help -- the name is the whole
+# question there.
+#
+# Tools that merely *can* write are deliberately absent: `docker ps` is the case
+# the classifier exists for, and the re-run still guards the rest of the line.
+LLM_HARD_DENY = {
+    "rm", "rmdir", "unlink", "shred", "dd", "mkfs", "mkswap", "wipefs",
+    "fdisk", "parted", "sgdisk", "truncate", "tee", "install",
+    "mv", "cp", "ln", "chmod", "chown", "chgrp", "touch", "mkdir",
+    "kill", "pkill", "killall", "reboot", "shutdown", "halt", "poweroff",
+    "mount", "umount", "swapoff", "swapon", "sysctl", "modprobe", "insmod",
+    "useradd", "userdel", "usermod", "groupadd", "passwd", "chpasswd",
+    "visudo", "sudo", "su", "doas", "pkexec", "setcap", "setfacl",
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "eval", "exec", "source",
+    "python", "python3", "perl", "ruby", "node", "php", "xargs",
+    "crontab", "at", "systemctl", "service", "launchctl",
+    "iptables", "nft", "ip", "ifconfig", "route",
+}
+
+# mkfs and fsck ship one binary per filesystem -- mkfs.ext4, fsck.xfs -- so the
+# names above only cover the dispatchers.
+LLM_HARD_DENY_PREFIXES = ("mkfs.", "fsck.", "mount.", "umount.")
+
+LLM_TIMEOUT = 30
+LLM_MODEL = "haiku"
+
+LLM_PROMPT = """\
+You are a permission classifier for a coding agent that is in planning mode. \
+Decide whether running this shell command line would be READ-ONLY.
+
+READ-ONLY means: it creates, modifies, deletes and renames nothing -- no file, \
+no process, no service, no remote resource, no configuration, no package. \
+Printing to stdout is read-only. Reading files is read-only. Querying a remote \
+API is read-only only if the request cannot change server state.
+
+Treat as NOT read-only: anything that writes or deletes, starts or stops \
+anything, installs or upgrades, sends a mutating request, or runs a program \
+whose behaviour you cannot see from the line itself.
+
+Judge the line on its own. Do not assume it is safe because it looks routine, \
+and do not assume an unfamiliar command is harmless. If you are not certain, \
+answer NO.
+
+Command line:
+%s
+
+Reply with exactly one word, YES or NO."""
+
+
+def llm_enabled():
+    import os
+
+    return os.environ.get(LLM_ENV, "").strip().lower() in LLM_ON
+
+
+def allowed_log_path(denied=None):
+    """Sibling of the denial log, holding the commands the classifier passed."""
+    denied = denied or log_path()
+    if not denied:
+        return None
+    import os
+
+    directory, name = os.path.split(denied)
+    return os.path.join(directory, name.replace("denied", "allowed", 1)
+                        if "denied" in name else "allowed.jsonl")
+
+
+def cached_allow(command):
+    """True when the classifier has already passed this exact command line.
+
+    The cache is the record: an entry means a verdict was reached and stands
+    until someone deletes the line. That is the point of keying on the exact
+    string -- the same line gets the same answer today and next month, instead
+    of a fresh roll of the dice each time it appears.
+    """
+    path = allowed_log_path()
+    if not path:
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    if json.loads(line).get("command") == command:
+                        return True
+                except ValueError:
+                    continue
+    except (IOError, OSError):
+        pass
+    return False
+
+
+def record_allow(command, name, cwd=None):
+    """Append one verdict. Never raises -- the decision is already made."""
+    try:
+        import os
+        import time
+
+        path = allowed_log_path()
+        if not path:
+            return
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, mode=0o700, exist_ok=True)
+        try:
+            if os.path.getsize(path) > LOG_MAX_BYTES:
+                os.replace(path, path + ".1")
+        except OSError:
+            pass
+        record = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "name": name,
+            "command": command,
+        }
+        if isinstance(cwd, str) and cwd:
+            record["cwd"] = cwd
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, (json.dumps(record, ensure_ascii=False) + "\n")
+                     .encode("utf-8"))
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
+
+
+def llm_says_read_only(command):
+    """Ask `claude -p`. Anything other than a clear YES is a no.
+
+    Every failure -- no binary, no network, timeout, unparseable answer --
+    returns False, which leaves the command exactly where it was: at the
+    permission prompt. The classifier can only ever remove a prompt, never add
+    a way for one to be skipped by accident.
+    """
+    try:
+        import subprocess
+
+        # The prompt goes on stdin, not as an argument: --disallowedTools takes
+        # a variadic list, so a trailing prompt is read as one more tool name
+        # and the run dies asking for input it was already given.
+        proc = subprocess.run(
+            ["claude", "-p", "--model", LLM_MODEL, "--max-turns", "1",
+             "--output-format", "json",
+             "--disallowedTools", "Bash,Read,Write,Edit,Glob,Grep,WebFetch,"
+                                  "WebSearch,Task,NotebookEdit"],
+            input=(LLM_PROMPT % command).encode("utf-8"),
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=LLM_TIMEOUT,
+        )
+        if proc.returncode != 0:
+            return False
+        payload = json.loads(proc.stdout.decode("utf-8", "replace"))
+        if payload.get("is_error"):
+            return False
+        return payload.get("result", "").strip().upper().rstrip(".") == "YES"
+    except Exception:
+        return False
+
+
+def llm_second_opinion(command, verdict, cwd=None):
+    """Re-judge a command the parser refused only because it did not know it.
+
+    A YES does not approve the line by itself. It adds the one name to the
+    allowlist and the parser runs again, so a command that clears the classifier
+    still has to clear every structural rule -- redirection, backticks, `cd`
+    before `git`. The classifier's power is exactly "this name is a reader",
+    which is the only question it was asked.
+    """
+    if not llm_enabled() or verdict["rule"] != UNKNOWN_COMMAND_RULE:
+        return False
+    name = verdict["detail"]
+    if not name or name in LLM_HARD_DENY:
+        return False
+    if name.startswith(LLM_HARD_DENY_PREFIXES):
+        return False
+    cached = cached_allow(command)
+    if not cached and not llm_says_read_only(command):
+        return False
+    if explain(command, extra_allowed=name) is not None:
+        return False
+    if not cached:
+        record_allow(command, name, cwd)
+    return True
 
 
 # ------------------------------------------------------------- denial log
@@ -990,7 +1385,41 @@ def report(path=None):
         if len(flat) > 88:
             flat = flat[:85] + "..."
         print("  %s  %s" % (record.get("ts", "?")[:16], flat))
+    report_allowed(path)
     return 0
+
+
+def report_allowed(denied=None):
+    """List what the classifier passed, grouped by command name.
+
+    Printed with the denials because the two halves answer one question between
+    them. The denial log says what nothing would allow; this says what the
+    parser could not express but the classifier recognised, and the name is the
+    aggregation key because the name is what would be added to the parser.
+    """
+    path = allowed_log_path(denied)
+    if not path:
+        return
+    records = load_log(path)
+    if not records:
+        return
+
+    by_name = {}
+    for record in records:
+        by_name.setdefault(record.get("name") or "?", []).append(
+            record.get("command", ""))
+
+    print("\n%s\n%d classifier verdicts, %d commands -- candidates to teach "
+          "the parser:\n" % (path, len(records), len(by_name)))
+    for name, commands in sorted(by_name.items(), key=lambda kv: -len(kv[1])):
+        print("%5d  %s" % (len(commands), name))
+        for example in sorted(set(commands))[:3]:
+            flat = " ".join(example.split())
+            if len(flat) > 80:
+                flat = flat[:77] + "..."
+            print("       %s" % flat)
+        if len(set(commands)) > 3:
+            print("       (+%d more)" % (len(set(commands)) - 3))
 
 
 # ---------------------------------------------------------------- entrypoint
@@ -1004,16 +1433,21 @@ def main():
     if not isinstance(command, str):
         return
     verdict = explain(command)
-    if verdict is None:
-        print(json.dumps({
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "allow",
-                "permissionDecisionReason": "plan mode: read-only command",
-            }
-        }))
-        return
-    log_denial(command, verdict, payload.get("cwd"))
+    reason = "plan mode: read-only command"
+    if verdict is not None:
+        # Nothing above this line costs a network round trip, and the classifier
+        # only ever sees what was already headed for a permission prompt.
+        if not llm_second_opinion(command, verdict, payload.get("cwd")):
+            log_denial(command, verdict, payload.get("cwd"))
+            return
+        reason = "plan mode: read-only command (classifier)"
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "permissionDecisionReason": reason,
+        }
+    }))
 
 
 if __name__ == "__main__":

@@ -24,16 +24,23 @@ LOGDIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plan-mode-autoallow"
 mkdir -p "$LOGDIR"
 chmod 700 "$LOGDIR"
 cat > "$LOGDIR/README.md" <<EOF
-# plan-mode-autoallow — 거부 로그
+# plan-mode-autoallow — 판정 로그
 
 이 디렉터리는 \`$DEST/plan-mode-autoallow.sh\` 훅이 쓴다. Claude Code가 plan
-mode일 때 실행하려던 Bash 명령 중 **읽기 전용으로 판정되지 않아 권한 프롬프트로
-넘어간 것**이 여기 쌓인다. 통과한 명령은 기록하지 않는다.
+mode일 때 실행하려던 Bash 명령의 판정 기록이다. 파서가 그냥 통과시킨 명령은
+기록하지 않는다.
 
-- \`denied.jsonl\` — 한 줄에 한 건, JSON Lines
+- \`denied.jsonl\` — 읽기 전용으로 판정되지 않아 권한 프롬프트로 넘어간 것
 - \`denied.jsonl.1\` — 2 MB를 넘으면 밀려난 이전 파일
+- \`allowed.jsonl\` — LLM 계층(\`PLAN_MODE_AUTOALLOW_LLM=on\`)을 켰을 때만
+  생긴다. 파서는 명령어를 몰라 거부했는데 분류기가 읽기 전용이라고 판정한 것
 
-레코드:
+두 파일이 답하는 질문이 다르다. \`denied\`는 **아무도 허용하지 않은 것**이라
+쓰기 명령이거나 아직 아무도 판단할 수 없는 것이고, \`allowed\`는 **파서가
+표현하지 못했을 뿐 읽기인 것**이라 파서에 가르칠 후보다. \`allowed\`는 캐시로도
+쓰이므로, 한 줄을 지우면 그 명령을 다음에 다시 묻는다.
+
+\`denied.jsonl\` 레코드:
 
 | 필드 | 뜻 |
 |---|---|
@@ -44,7 +51,8 @@ mode일 때 실행하려던 Bash 명령 중 **읽기 전용으로 판정되지 �
 | \`command\` | 명령줄 전체 |
 | \`cwd\` | 실행하려던 디렉터리 |
 
-집계해서 보려면 (규칙별 건수 + 규칙 안에서 값별 건수):
+집계해서 보려면 (규칙별 건수 + 규칙 안에서 값별 건수, 그리고 \`allowed.jsonl\`이
+있으면 명령어별 승격 후보까지):
 
 \`\`\`sh
 python3 $DEST/readonly_cmd.py --report
@@ -81,3 +89,7 @@ cat <<'JSON'
 
 JSON
 echo "Then start a new Claude Code session -- hooks load at startup."
+echo
+echo "Optional: PLAN_MODE_AUTOALLOW_LLM=on refers commands the parser does not"
+echo "recognise to 'claude -p' for a second opinion. Off by default because it"
+echo "spends tokens; see the \"모르는 명령\" section of the project README."

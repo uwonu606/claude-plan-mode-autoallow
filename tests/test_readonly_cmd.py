@@ -26,7 +26,7 @@ ALLOW = [
     "awk '{print $1}' file.txt",
     "timeout 30 grep -r foo .",
     "env",
-    "env FOO=bar ls",
+    "env LANG=C ls",
     "while read -r l; do echo x; done" if False else "ls | wc -l",
     "git status --short",
     "git config --get user.email",
@@ -193,6 +193,33 @@ HARDENING = [
     ("PATH=/tmp ls", False),
     ("LESSOPEN='|sh %s' cat f", False),
     ("IFS=x ls", False),
+    # `env` in front must not launder any of the above. It used to: the wrapper
+    # discarded assignments instead of checking them, so every vector on this
+    # list came back to life with four characters in front of it.
+    ("env PAGER='sh -c \"exec sh\"' git log", False),
+    ("env GIT_EXTERNAL_DIFF=/usr/bin/id git diff", False),
+    ("env GIT_SSH_COMMAND=id git ls-remote origin", False),
+    ("env GIT_PAGER=sh git log", False),
+    ("env LD_PRELOAD=/tmp/x.so ls", False),
+    ("env BASH_ENV=/tmp/x ls", False),
+    ("env FOO=bar ls", False),
+    # -S splits its operand into a command line, so the wrapped command never
+    # appears as a word of its own. Attached form only -- `env -S "sh -c id"`
+    # separates into a word that was already rejected as an unknown command.
+    ('env -S"touch pwned"', False),
+    ('env -S"sh -c id"', False),
+    ('env -vS"id"', False),
+    ('env --split-string="touch x"', False),
+    # -a renames argv[0], so the validated name is not the one that runs.
+    ("env -a foo /bin/sh", False),
+    ("env -C /tmp ls", False),
+    ("env -i ls", True),
+    ("env - ls", True),
+    ("env -u PATH ls", True),
+    ("env -uPATH ls", True),
+    ("env --unset=PATH ls", True),
+    ("env LANG=C ls", True),
+    ("env LC_ALL=C sort file", True),
     ("LC_ALL=C sort file", True),
     ("LANG=C grep foo f", True),
     ("TZ=UTC date", True),
@@ -207,6 +234,67 @@ HARDENING = [
     ("ls *.ts", True),
     ("wc -l src/*.py", True),
     ("cat *.md", True),
+    # file, sort and awk list the flags they accept instead of the ones they
+    # refuse. Each was moved after a denylist let something through, so the
+    # cases below are the specific escapes plus enough ordinary usage to catch
+    # an allowlist that is too narrow. Short flags bundle and carry attached
+    # values, which is where the first attempt at this broke.
+    ("file -C", False),
+    ("file --compile", False),
+    ("file -S x", False),
+    ("file -z x", False),
+    ("file --magic-file=/tmp/m x", False),
+    ("file -b f", True),
+    ("file -bi f", True),
+    ("file --mime-type f", True),
+    ("file -e soft x", True),
+    ("file -P bytes=100 f", True),
+    ("sort --compress-program=sh f", False),
+    ("sort --compress-program sh f", False),
+    ("sort -oout f", False),
+    ("sort --output=out f", False),
+    ("sort -rn f", True),
+    ("sort -k2,3 -t: f", True),
+    ("sort -S 50% --parallel=4 f", True),
+    ("sort --files0-from=l", True),
+    ("awk -f prog.awk f", False),
+    ("awk --file=prog.awk f", False),
+    ("awk -o out.awk 'BEGIN{}'", False),
+    ("awk -p prof 'BEGIN{}'", False),
+    ("awk -d vars 'BEGIN{}'", False),
+    ("awk -l lib 'BEGIN{}'", False),
+    ("awk --load=lib 'BEGIN{}'", False),
+    ("awk -E prog.awk", False),
+    ("awk -e '{system(\"id\")}' f", False),
+    ("awk --source='{print|\"sh\"}' f", False),
+    ("awk -F: '{print $1}' f", True),
+    ("awk -F : '{print $1}' f", True),
+    ("awk -v x=1 '{print x}' f", True),
+    ("awk -e '{print $1}' f", True),
+    ("awk '{ if (a >= b) print }' f", True),
+    # date prints through a +FORMAT operand and nothing else, so any other
+    # operand is BSD's flagless way of setting the clock. -s covers only GNU.
+    ("date -s 2020-01-01", False),
+    ("date --set=2020-01-01", False),
+    ("date 010100002026", False),
+    ("date 1231235959", False),
+    ("date", True),
+    ("date +%Y-%m-%d", True),
+    ("date -u +%s", True),
+    ("date -d yesterday +%F", True),
+    ("date --date='2 days ago' +%F", True),
+    ("date -Iseconds", True),
+    ("date --iso-8601=seconds", True),
+    # hostname renames the host from a bare operand or -F; uname -n reads it.
+    ("hostname pwned", False),
+    ("hostname -F /tmp/n", False),
+    ("hostname", False),
+    ("uname -n", True),
+    # A /bin or /usr/bin prefix is only a guarantee while the path stays there.
+    ("/bin/../tmp/ls", False),
+    ("/usr/bin/../../tmp/ls", False),
+    ("/bin/ls", True),
+    ("/usr/bin/git log", True),
     ("rg --pre /tmp/evil foo", False),
     ("rg -z foo", False),
     ("rg --search-zip foo", False),
@@ -445,8 +533,119 @@ for _name, _ok in log_checks:
         log_fail += 1
 print("log: %d/%d passed" % (len(log_checks) - log_fail, len(log_checks)))
 
+# --- LLM tier. The classifier itself is replaced with a stub: what is worth
+# --- testing here is the routing around it, and that has to stay deterministic.
+# --- Whether the real model answers well is a separate question, measured by
+# --- tests/eval_llm.py against live calls.
+import readonly_cmd as rc
+
+llm_checks = []
+
+
+def llm_check(name, ok):
+    llm_checks.append((name, ok))
+
+
+class FakeClassifier(object):
+    """Stands in for `claude -p`, recording whether it was consulted at all."""
+
+    def __init__(self, answer):
+        self.answer = answer
+        self.asked = []
+
+    def __call__(self, command):
+        self.asked.append(command)
+        return self.answer
+
+
+def with_classifier(answer, command, enabled=True, cwd=None):
+    saved_call, saved_env = rc.llm_says_read_only, os.environ.get(rc.LLM_ENV)
+    fake = FakeClassifier(answer)
+    rc.llm_says_read_only = fake
+    os.environ[rc.LLM_ENV] = "on" if enabled else "off"
+    try:
+        verdict = rc.explain(command)
+        allowed = (verdict is not None
+                   and rc.llm_second_opinion(command, verdict, cwd))
+        return allowed, fake.asked
+    finally:
+        rc.llm_says_read_only = saved_call
+        if saved_env is None:
+            os.environ.pop(rc.LLM_ENV, None)
+        else:
+            os.environ[rc.LLM_ENV] = saved_env
+
+
+_llm_tmp = tempfile.mkdtemp(prefix="autoallow-llm-")
+_llm_saved = os.environ.get("PLAN_MODE_AUTOALLOW_LOG")
+os.environ["PLAN_MODE_AUTOALLOW_LOG"] = os.path.join(_llm_tmp, "denied.jsonl")
+try:
+    allowed, asked = with_classifier(True, "docker ps")
+    llm_check("a yes on an unknown command allows it", allowed and asked)
+
+    allowed, asked = with_classifier(False, "terraform apply")
+    llm_check("a no leaves the command at the prompt", not allowed and asked)
+
+    allowed, asked = with_classifier(True, "cargo build", enabled=False)
+    llm_check("off by default: not consulted, not allowed",
+              not allowed and not asked)
+
+    # Structural denials never reach the classifier: those rules are the whole
+    # job of the parser, and a model does not get a vote on them.
+    for line in ("echo hi > /tmp/o", "cat `id`", "eval ls", "python3 -c x",
+                 "cat <(id)"):
+        allowed, asked = with_classifier(True, line)
+        llm_check("structural denial is not referred out: %s" % line,
+                  not allowed and not asked)
+
+    for name in ("rm -rf /tmp/x", "sudo ls", "chmod 777 f", "sh -c id",
+                 "kill 1", "mkfs.ext4 /dev/sda", "fsck.ext4 /dev/sda"):
+        allowed, asked = with_classifier(True, name)
+        llm_check("hard deny is not referred out: %s" % name,
+                  not allowed and not asked)
+
+    # A yes buys one command name, not a pass on the rest of the line.
+    for line in ("docker ps | rm -rf /tmp/x", "docker ps && cd /tmp && git log"):
+        allowed, _ = with_classifier(True, line)
+        llm_check("re-run still applies every other rule: %s" % line,
+                  not allowed)
+
+    allowed, _ = with_classifier(True, "docker ps | grep foo")
+    llm_check("the rest of the line may be ordinary read-only commands", allowed)
+
+    # ALWAYS_OK is mutated for the re-run and must not stay mutated.
+    llm_check("the vouched-for name does not leak into the allowlist",
+              "docker" not in rc.ALWAYS_OK
+              and rc.explain("docker ps") is not None)
+
+    allowed_path = rc.allowed_log_path()
+    llm_check("verdicts are recorded beside the denials",
+              allowed_path == os.path.join(_llm_tmp, "allowed.jsonl")
+              and os.path.exists(allowed_path))
+    entry = _json.loads(open(allowed_path, encoding="utf-8").readline())
+    llm_check("the record keys on the command name",
+              entry["name"] == "docker" and entry["command"] == "docker ps")
+
+    # A cached verdict stands on its own, without asking again.
+    allowed, asked = with_classifier(False, "docker ps")
+    llm_check("a cached yes is reused and the model is not consulted",
+              allowed and not asked)
+finally:
+    if _llm_saved is None:
+        os.environ.pop("PLAN_MODE_AUTOALLOW_LOG", None)
+    else:
+        os.environ["PLAN_MODE_AUTOALLOW_LOG"] = _llm_saved
+    shutil.rmtree(_llm_tmp, ignore_errors=True)
+
+llm_fail = 0
+for _name, _ok in llm_checks:
+    if not _ok:
+        print("FAIL (llm): %s" % _name)
+        llm_fail += 1
+print("llm: %d/%d passed" % (len(llm_checks) - llm_fail, len(llm_checks)))
+
 total = (len(ALLOW) + len(DENY) + len(EXTRA) + len(HARDENING) + len(GH)
-         + len(log_checks))
-total_fail = fails + extra_fail + hard_fail + gh_fail + log_fail
+         + len(log_checks) + len(llm_checks))
+total_fail = fails + extra_fail + hard_fail + gh_fail + log_fail + llm_fail
 print("TOTAL: %d/%d passed" % (total - total_fail, total))
 sys.exit(1 if total_fail else 0)
