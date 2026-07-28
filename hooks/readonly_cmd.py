@@ -22,10 +22,12 @@ import sys
 ALWAYS_OK = {
     "ls", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "rg", "fd",
     "tree", "file", "stat", "du", "df", "diff", "uniq", "cut", "jq", "which",
-    "type", "date", "pwd", "basename", "dirname", "realpath", "readlink",
+    "type", "pwd", "basename", "dirname", "realpath", "readlink",
     "echo", "printf", "true", "false", "test", "[", "[[", "seq", "column",
     "comm", "join", "paste", "nl", "tac", "rev", "md5sum", "sha256sum",
-    "cksum", "cd", "pushd", "popd", "hostname", "uname", "whoami", "id",
+    # `hostname` is absent on purpose: with an operand or -F it renames the
+    # host. Reading the name is already covered by `uname -n`.
+    "cksum", "cd", "pushd", "popd", "uname", "whoami", "id",
     "groups", "ps", "locale", "tty", "printenv", "wait", "sleep", "expr",
     # Present in Claude Code's own read-only set (extracted from the 2.1.220
     # binary) and absent here until now.
@@ -99,6 +101,18 @@ AWK_FLAGS_OK = {"--posix", "--traditional", "-c", "--re-interval",
                 "--help", "--version"}
 AWK_FLAGS_WITH_VALUE = {"-F", "--field-separator", "-v", "--assign"}
 AWK_PROGRAM_FLAGS = {"-e", "--source"}
+
+# `date` needs an allowlist for a reason the other three do not share: on
+# BSD/macOS it takes the new clock value as a bare operand, with no flag at all
+# (`date 010100002026`). Refusing -s and --set only covers GNU. Everything date
+# prints goes through a `+FORMAT` operand, so anything else is a set.
+DATE_FLAGS_OK = {
+    "-u", "--utc", "--universal", "-R", "--rfc-email", "--iso-8601",
+    "--rfc-3339", "--debug", "--help", "--version",
+    "-I", "-Idate", "-Ihours", "-Iminutes", "-Iseconds", "-Ins",
+}
+DATE_FLAGS_WITH_VALUE = {"-d", "--date", "-f", "--file",
+                         "-r", "--reference"}
 
 # jq can read arbitrary files and load modules: -f/--from-file, --rawfile,
 # --slurpfile, -L/--library-path, --run-tests, and `env`/`$ENV`/`include`/
@@ -525,6 +539,13 @@ def walk_flags(args, exact_ok, with_value, cmd, value_hook=None):
             i += 1
             continue
 
+        # A short flag that carries an optional attached value can be spelled
+        # out whole (date's -Iseconds); bundles like -rn fall through to the
+        # per-character walk below.
+        if a in exact_ok:
+            i += 1
+            continue
+
         j = 1
         while j < len(a):
             flag = "-" + a[j]
@@ -547,6 +568,13 @@ def walk_flags(args, exact_ok, with_value, cmd, value_hook=None):
 
 def check_sort(args):
     walk_flags(args, SORT_FLAGS_OK, SORT_FLAGS_WITH_VALUE, "sort")
+
+
+def check_date(args):
+    for operand in walk_flags(args, DATE_FLAGS_OK, DATE_FLAGS_WITH_VALUE,
+                              "date"):
+        if not operand.startswith("+"):
+            raise Deny("date sets the clock from %r", operand)
 
 
 def check_awk_program(text):
@@ -833,6 +861,7 @@ def check_git(args):
 CHECKERS = {
     "find": check_find,
     "sort": check_sort,
+    "date": check_date,
     "awk": check_awk,
     "gawk": check_awk,
     "mawk": check_awk,
@@ -880,6 +909,10 @@ def validate_command(words, depth=0):
         raise Deny("indirect command")
     if "/" in cmd:
         if not (cmd.startswith("/usr/bin/") or cmd.startswith("/bin/")):
+            raise Deny("path-qualified command %r", cmd)
+        # The prefix only means anything if the path stays under it. Without
+        # this, `/bin/../tmp/ls` is checked as `ls` and runs `/tmp/ls`.
+        if ".." in cmd.split("/"):
             raise Deny("path-qualified command %r", cmd)
         cmd = cmd.rsplit("/", 1)[1]
 
