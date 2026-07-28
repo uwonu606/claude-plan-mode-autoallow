@@ -21,9 +21,9 @@ for d in */; do n=${d%/}; g=$( [ -d "$n/.git" ] && echo git || echo "-" ); \
 
 ## 왜 auto 모드로 해결하지 않는가
 
-auto 모드의 권한 분류기는 대화 트랜스크립트를 입력으로 받는 2단계 **LLM 호출**이다. 판정 한 번마다 네트워크 왕복이 들고, 토큰을 쓰고, 트랜스크립트가 길어질수록 성능이 떨어지며(`Classifier transcript exceeded context window → falling back to manual approval`), API를 못 쓰면 fail closed로 떨어진다. 이 훅은 네트워크도 토큰도 없이 ~14 ms에 판정한다.
+auto 모드의 권한 분류기는 대화 트랜스크립트를 입력으로 받는 2단계 **LLM 호출**이다. 모든 판정이 LLM을 타지는 않는다. 앞에 공짜 관문이 둘 있어서, 도구가 안전 목록에 있거나 모드를 `acceptEdits`로 바꿔 다시 검사했을 때 통과하면 거기서 끝난다(2.1.220 바이너리 기준). 문제는 이 훅이 겨냥하는 명령이 그 두 관문에 걸리지 않는다는 것이다. Bash는 안전 목록에 없고, 복합 명령은 위에서 본 프리픽스 추출 실패 때문에 `acceptEdits`에서도 자동 승인되지 않는다. 그래서 이런 줄은 auto 모드에서 매번 왕복을 문다 — 토큰을 쓰고, 트랜스크립트가 길어지면 컨텍스트를 넘겨 평소의 권한 처리로 떨어지고(`Auto mode classifier transcript too long, falling back to normal permission handling`), API를 못 쓰면 fail closed로 거부된다. 이 훅은 네트워크도 토큰도 없이 ~14 ms에 판정한다.
 
-auto 모드에서 *공짜인* 절반 — Claude Code 내장 `isReadOnly` 검사 — 은 plan mode에서도 이미 돌고 있다. 이 훅은 그것의 대체재가 아니라, 그 검사가 거부하는 복합 명령을 덮는 물건이다.
+plan mode에는 Claude Code 내장 읽기 전용 검사가 이미 돌고 있다. 이 훅은 그것의 대체재가 아니라, 그 검사가 거부하는 복합 명령을 덮는 물건이다.
 
 ## 무엇을 통과시키는가
 
