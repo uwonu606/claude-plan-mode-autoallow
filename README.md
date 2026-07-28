@@ -180,6 +180,22 @@ python3 hooks/readonly_cmd.py --report
 
 규칙별 건수와 규칙 안의 값별 건수가 같이 나온다. 첫 줄이 `command not on read-only allowlist`이고 `detail`에 같은 명령이 반복되면 allowlist에 넣을 후보다. 로테이션된 `.1`도 같이 읽는다 — 오래 모인 데이터가 거기 있다.
 
+`allowed.jsonl`이 있으면 이어서 명령어별로 묶어 보여준다. 이쪽 집계 키가 규칙이 아니라 **명령어 이름**인 이유는, 파서에 실제로 추가하게 되는 단위가 그것이기 때문이다:
+
+```
+6 classifier verdicts, 3 commands -- candidates to teach the parser:
+
+    4  docker
+       docker images
+       docker logs web
+       docker ps
+       (+1 more)
+    1  kubectl
+       kubectl get pods
+```
+
+`docker`가 네 번 올라왔다는 건 이제 `check_docker`를 쓸 때가 됐다는 뜻이다. 쓰고 나면 그 줄들은 파서에서 ~14 ms에 끝나고 분류기를 부르지 않는다.
+
 | | |
 |---|---|
 | 경로 | `PLAN_MODE_AUTOALLOW_LOG=/some/path`, 끄려면 `off`. `CLAUDE_CONFIG_DIR`이 설정돼 있으면 그 아래를 기본값으로 쓴다. 없는 상위 디렉터리는 만든다. |

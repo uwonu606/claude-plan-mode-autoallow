@@ -1116,9 +1116,9 @@ def llm_enabled():
     return os.environ.get(LLM_ENV, "").strip().lower() in LLM_ON
 
 
-def allowed_log_path():
+def allowed_log_path(denied=None):
     """Sibling of the denial log, holding the commands the classifier passed."""
-    denied = log_path()
+    denied = denied or log_path()
     if not denied:
         return None
     import os
@@ -1385,7 +1385,41 @@ def report(path=None):
         if len(flat) > 88:
             flat = flat[:85] + "..."
         print("  %s  %s" % (record.get("ts", "?")[:16], flat))
+    report_allowed(path)
     return 0
+
+
+def report_allowed(denied=None):
+    """List what the classifier passed, grouped by command name.
+
+    Printed with the denials because the two halves answer one question between
+    them. The denial log says what nothing would allow; this says what the
+    parser could not express but the classifier recognised, and the name is the
+    aggregation key because the name is what would be added to the parser.
+    """
+    path = allowed_log_path(denied)
+    if not path:
+        return
+    records = load_log(path)
+    if not records:
+        return
+
+    by_name = {}
+    for record in records:
+        by_name.setdefault(record.get("name") or "?", []).append(
+            record.get("command", ""))
+
+    print("\n%s\n%d classifier verdicts, %d commands -- candidates to teach "
+          "the parser:\n" % (path, len(records), len(by_name)))
+    for name, commands in sorted(by_name.items(), key=lambda kv: -len(kv[1])):
+        print("%5d  %s" % (len(commands), name))
+        for example in sorted(set(commands))[:3]:
+            flat = " ".join(example.split())
+            if len(flat) > 80:
+                flat = flat[:77] + "..."
+            print("       %s" % flat)
+        if len(set(commands)) > 3:
+            print("       (+%d more)" % (len(set(commands)) - 3))
 
 
 # ---------------------------------------------------------------- entrypoint
