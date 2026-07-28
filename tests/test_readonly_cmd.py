@@ -533,8 +533,119 @@ for _name, _ok in log_checks:
         log_fail += 1
 print("log: %d/%d passed" % (len(log_checks) - log_fail, len(log_checks)))
 
+# --- LLM tier. The classifier itself is replaced with a stub: what is worth
+# --- testing here is the routing around it, and that has to stay deterministic.
+# --- Whether the real model answers well is a separate question, measured by
+# --- tests/eval_llm.py against live calls.
+import readonly_cmd as rc
+
+llm_checks = []
+
+
+def llm_check(name, ok):
+    llm_checks.append((name, ok))
+
+
+class FakeClassifier(object):
+    """Stands in for `claude -p`, recording whether it was consulted at all."""
+
+    def __init__(self, answer):
+        self.answer = answer
+        self.asked = []
+
+    def __call__(self, command):
+        self.asked.append(command)
+        return self.answer
+
+
+def with_classifier(answer, command, enabled=True, cwd=None):
+    saved_call, saved_env = rc.llm_says_read_only, os.environ.get(rc.LLM_ENV)
+    fake = FakeClassifier(answer)
+    rc.llm_says_read_only = fake
+    os.environ[rc.LLM_ENV] = "on" if enabled else "off"
+    try:
+        verdict = rc.explain(command)
+        allowed = (verdict is not None
+                   and rc.llm_second_opinion(command, verdict, cwd))
+        return allowed, fake.asked
+    finally:
+        rc.llm_says_read_only = saved_call
+        if saved_env is None:
+            os.environ.pop(rc.LLM_ENV, None)
+        else:
+            os.environ[rc.LLM_ENV] = saved_env
+
+
+_llm_tmp = tempfile.mkdtemp(prefix="autoallow-llm-")
+_llm_saved = os.environ.get("PLAN_MODE_AUTOALLOW_LOG")
+os.environ["PLAN_MODE_AUTOALLOW_LOG"] = os.path.join(_llm_tmp, "denied.jsonl")
+try:
+    allowed, asked = with_classifier(True, "docker ps")
+    llm_check("a yes on an unknown command allows it", allowed and asked)
+
+    allowed, asked = with_classifier(False, "terraform apply")
+    llm_check("a no leaves the command at the prompt", not allowed and asked)
+
+    allowed, asked = with_classifier(True, "cargo build", enabled=False)
+    llm_check("off by default: not consulted, not allowed",
+              not allowed and not asked)
+
+    # Structural denials never reach the classifier: those rules are the whole
+    # job of the parser, and a model does not get a vote on them.
+    for line in ("echo hi > /tmp/o", "cat `id`", "eval ls", "python3 -c x",
+                 "cat <(id)"):
+        allowed, asked = with_classifier(True, line)
+        llm_check("structural denial is not referred out: %s" % line,
+                  not allowed and not asked)
+
+    for name in ("rm -rf /tmp/x", "sudo ls", "chmod 777 f", "sh -c id",
+                 "kill 1", "mkfs.ext4 /dev/sda", "fsck.ext4 /dev/sda"):
+        allowed, asked = with_classifier(True, name)
+        llm_check("hard deny is not referred out: %s" % name,
+                  not allowed and not asked)
+
+    # A yes buys one command name, not a pass on the rest of the line.
+    for line in ("docker ps | rm -rf /tmp/x", "docker ps && cd /tmp && git log"):
+        allowed, _ = with_classifier(True, line)
+        llm_check("re-run still applies every other rule: %s" % line,
+                  not allowed)
+
+    allowed, _ = with_classifier(True, "docker ps | grep foo")
+    llm_check("the rest of the line may be ordinary read-only commands", allowed)
+
+    # ALWAYS_OK is mutated for the re-run and must not stay mutated.
+    llm_check("the vouched-for name does not leak into the allowlist",
+              "docker" not in rc.ALWAYS_OK
+              and rc.explain("docker ps") is not None)
+
+    allowed_path = rc.allowed_log_path()
+    llm_check("verdicts are recorded beside the denials",
+              allowed_path == os.path.join(_llm_tmp, "allowed.jsonl")
+              and os.path.exists(allowed_path))
+    entry = _json.loads(open(allowed_path, encoding="utf-8").readline())
+    llm_check("the record keys on the command name",
+              entry["name"] == "docker" and entry["command"] == "docker ps")
+
+    # A cached verdict stands on its own, without asking again.
+    allowed, asked = with_classifier(False, "docker ps")
+    llm_check("a cached yes is reused and the model is not consulted",
+              allowed and not asked)
+finally:
+    if _llm_saved is None:
+        os.environ.pop("PLAN_MODE_AUTOALLOW_LOG", None)
+    else:
+        os.environ["PLAN_MODE_AUTOALLOW_LOG"] = _llm_saved
+    shutil.rmtree(_llm_tmp, ignore_errors=True)
+
+llm_fail = 0
+for _name, _ok in llm_checks:
+    if not _ok:
+        print("FAIL (llm): %s" % _name)
+        llm_fail += 1
+print("llm: %d/%d passed" % (len(llm_checks) - llm_fail, len(llm_checks)))
+
 total = (len(ALLOW) + len(DENY) + len(EXTRA) + len(HARDENING) + len(GH)
-         + len(log_checks))
-total_fail = fails + extra_fail + hard_fail + gh_fail + log_fail
+         + len(log_checks) + len(llm_checks))
+total_fail = fails + extra_fail + hard_fail + gh_fail + log_fail + llm_fail
 print("TOTAL: %d/%d passed" % (total - total_fail, total))
 sys.exit(1 if total_fail else 0)

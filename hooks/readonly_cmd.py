@@ -1000,8 +1000,12 @@ def check_whole_line():
         raise Deny("cd before git can execute hooks from the target directory")
 
 
-def explain(command):
+def explain(command, extra_allowed=None):
     """None when the whole line is read-only, otherwise why it was rejected.
+
+    `extra_allowed` adds one command name to the allowlist for this call only.
+    It exists so a name the LLM classifier vouched for can be re-checked against
+    every other rule rather than bypassing them.
 
     The reason is what makes the denial log worth keeping: it turns "this
     prompted" into "this prompted because `sed -i` writes in place", which is
@@ -1011,6 +1015,9 @@ def explain(command):
         return {"rule": "empty command", "detail": None,
                 "reason": "empty command"}
     del SEEN_COMMANDS[:]
+    added = extra_allowed and extra_allowed not in ALWAYS_OK
+    if added:
+        ALWAYS_OK.add(extra_allowed)
     try:
         validate_line(command)
         check_whole_line()
@@ -1025,10 +1032,217 @@ def explain(command):
         name = type(exc).__name__
         return {"rule": "parse error", "detail": name,
                 "reason": "parse error: %s" % name}
+    finally:
+        if added:
+            ALWAYS_OK.discard(extra_allowed)
 
 
 def is_read_only(command):
     return explain(command) is None
+
+
+# ------------------------------------------------------- LLM second opinion
+
+# The one denial that means "I have never heard of this command" rather than "I
+# know this shape and it writes". Only that one is worth a second opinion: the
+# others are the structural rules -- redirection, backticks, indirect execution
+# -- and those are the parser's whole job.
+UNKNOWN_COMMAND_RULE = "command not on read-only allowlist"
+
+LLM_ENV = "PLAN_MODE_AUTOALLOW_LLM"
+LLM_ON = {"1", "on", "yes", "true"}
+
+# Names that never reach the classifier, however it might vote. This is the list
+# that decides how far a wrong answer can travel, and it holds two kinds of name.
+#
+# Most exist only to change something, so "read-only" is not a judgement call
+# there, it is a wrong answer. The rest -- systemctl, ip, iptables, sysctl --
+# do have reading subcommands, and by the rule above they belong with docker and
+# kubectl, out where the classifier can vote on them. They are held back anyway,
+# because the two mistakes are not the same size: a needless prompt for
+# `systemctl status` costs a keystroke, and a wrong yes for `systemctl stop`
+# has nothing behind it. The parser re-run cannot help -- the name is the whole
+# question there.
+#
+# Tools that merely *can* write are deliberately absent: `docker ps` is the case
+# the classifier exists for, and the re-run still guards the rest of the line.
+LLM_HARD_DENY = {
+    "rm", "rmdir", "unlink", "shred", "dd", "mkfs", "mkswap", "wipefs",
+    "fdisk", "parted", "sgdisk", "truncate", "tee", "install",
+    "mv", "cp", "ln", "chmod", "chown", "chgrp", "touch", "mkdir",
+    "kill", "pkill", "killall", "reboot", "shutdown", "halt", "poweroff",
+    "mount", "umount", "swapoff", "swapon", "sysctl", "modprobe", "insmod",
+    "useradd", "userdel", "usermod", "groupadd", "passwd", "chpasswd",
+    "visudo", "sudo", "su", "doas", "pkexec", "setcap", "setfacl",
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "eval", "exec", "source",
+    "python", "python3", "perl", "ruby", "node", "php", "xargs",
+    "crontab", "at", "systemctl", "service", "launchctl",
+    "iptables", "nft", "ip", "ifconfig", "route",
+}
+
+# mkfs and fsck ship one binary per filesystem -- mkfs.ext4, fsck.xfs -- so the
+# names above only cover the dispatchers.
+LLM_HARD_DENY_PREFIXES = ("mkfs.", "fsck.", "mount.", "umount.")
+
+LLM_TIMEOUT = 30
+LLM_MODEL = "haiku"
+
+LLM_PROMPT = """\
+You are a permission classifier for a coding agent that is in planning mode. \
+Decide whether running this shell command line would be READ-ONLY.
+
+READ-ONLY means: it creates, modifies, deletes and renames nothing -- no file, \
+no process, no service, no remote resource, no configuration, no package. \
+Printing to stdout is read-only. Reading files is read-only. Querying a remote \
+API is read-only only if the request cannot change server state.
+
+Treat as NOT read-only: anything that writes or deletes, starts or stops \
+anything, installs or upgrades, sends a mutating request, or runs a program \
+whose behaviour you cannot see from the line itself.
+
+Judge the line on its own. Do not assume it is safe because it looks routine, \
+and do not assume an unfamiliar command is harmless. If you are not certain, \
+answer NO.
+
+Command line:
+%s
+
+Reply with exactly one word, YES or NO."""
+
+
+def llm_enabled():
+    import os
+
+    return os.environ.get(LLM_ENV, "").strip().lower() in LLM_ON
+
+
+def allowed_log_path():
+    """Sibling of the denial log, holding the commands the classifier passed."""
+    denied = log_path()
+    if not denied:
+        return None
+    import os
+
+    directory, name = os.path.split(denied)
+    return os.path.join(directory, name.replace("denied", "allowed", 1)
+                        if "denied" in name else "allowed.jsonl")
+
+
+def cached_allow(command):
+    """True when the classifier has already passed this exact command line.
+
+    The cache is the record: an entry means a verdict was reached and stands
+    until someone deletes the line. That is the point of keying on the exact
+    string -- the same line gets the same answer today and next month, instead
+    of a fresh roll of the dice each time it appears.
+    """
+    path = allowed_log_path()
+    if not path:
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    if json.loads(line).get("command") == command:
+                        return True
+                except ValueError:
+                    continue
+    except (IOError, OSError):
+        pass
+    return False
+
+
+def record_allow(command, name, cwd=None):
+    """Append one verdict. Never raises -- the decision is already made."""
+    try:
+        import os
+        import time
+
+        path = allowed_log_path()
+        if not path:
+            return
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, mode=0o700, exist_ok=True)
+        try:
+            if os.path.getsize(path) > LOG_MAX_BYTES:
+                os.replace(path, path + ".1")
+        except OSError:
+            pass
+        record = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "name": name,
+            "command": command,
+        }
+        if isinstance(cwd, str) and cwd:
+            record["cwd"] = cwd
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, (json.dumps(record, ensure_ascii=False) + "\n")
+                     .encode("utf-8"))
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
+
+
+def llm_says_read_only(command):
+    """Ask `claude -p`. Anything other than a clear YES is a no.
+
+    Every failure -- no binary, no network, timeout, unparseable answer --
+    returns False, which leaves the command exactly where it was: at the
+    permission prompt. The classifier can only ever remove a prompt, never add
+    a way for one to be skipped by accident.
+    """
+    try:
+        import subprocess
+
+        # The prompt goes on stdin, not as an argument: --disallowedTools takes
+        # a variadic list, so a trailing prompt is read as one more tool name
+        # and the run dies asking for input it was already given.
+        proc = subprocess.run(
+            ["claude", "-p", "--model", LLM_MODEL, "--max-turns", "1",
+             "--output-format", "json",
+             "--disallowedTools", "Bash,Read,Write,Edit,Glob,Grep,WebFetch,"
+                                  "WebSearch,Task,NotebookEdit"],
+            input=(LLM_PROMPT % command).encode("utf-8"),
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=LLM_TIMEOUT,
+        )
+        if proc.returncode != 0:
+            return False
+        payload = json.loads(proc.stdout.decode("utf-8", "replace"))
+        if payload.get("is_error"):
+            return False
+        return payload.get("result", "").strip().upper().rstrip(".") == "YES"
+    except Exception:
+        return False
+
+
+def llm_second_opinion(command, verdict, cwd=None):
+    """Re-judge a command the parser refused only because it did not know it.
+
+    A YES does not approve the line by itself. It adds the one name to the
+    allowlist and the parser runs again, so a command that clears the classifier
+    still has to clear every structural rule -- redirection, backticks, `cd`
+    before `git`. The classifier's power is exactly "this name is a reader",
+    which is the only question it was asked.
+    """
+    if not llm_enabled() or verdict["rule"] != UNKNOWN_COMMAND_RULE:
+        return False
+    name = verdict["detail"]
+    if not name or name in LLM_HARD_DENY:
+        return False
+    if name.startswith(LLM_HARD_DENY_PREFIXES):
+        return False
+    cached = cached_allow(command)
+    if not cached and not llm_says_read_only(command):
+        return False
+    if explain(command, extra_allowed=name) is not None:
+        return False
+    if not cached:
+        record_allow(command, name, cwd)
+    return True
 
 
 # ------------------------------------------------------------- denial log
@@ -1185,16 +1399,21 @@ def main():
     if not isinstance(command, str):
         return
     verdict = explain(command)
-    if verdict is None:
-        print(json.dumps({
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "allow",
-                "permissionDecisionReason": "plan mode: read-only command",
-            }
-        }))
-        return
-    log_denial(command, verdict, payload.get("cwd"))
+    reason = "plan mode: read-only command"
+    if verdict is not None:
+        # Nothing above this line costs a network round trip, and the classifier
+        # only ever sees what was already headed for a permission prompt.
+        if not llm_second_opinion(command, verdict, payload.get("cwd")):
+            log_denial(command, verdict, payload.get("cwd"))
+            return
+        reason = "plan mode: read-only command (classifier)"
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "permissionDecisionReason": reason,
+        }
+    }))
 
 
 if __name__ == "__main__":
