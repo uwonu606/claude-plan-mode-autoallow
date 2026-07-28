@@ -31,20 +31,25 @@ plan mode에는 Claude Code 내장 읽기 전용 검사가 이미 돌고 있다.
 
 무조건 허용: 읽기 전용 도구 고정 목록(`ls cat head tail wc grep rg stat du df diff cut tr strings hexdump od …`). 여기에 더해 아래 명령들은 인자를 검사한 뒤 허용한다:
 
-| 명령 | 거부 조건 |
-|---|---|
-| `find` | `-exec` `-execdir` `-ok` `-okdir` `-delete` `-fprint*` `-fls` `-files0-from` |
-| `sort` | `-o` / `--output` |
-| `awk` | 프로그램에 `system` `close(` `ENVIRON` `getline`, `>` 리다이렉션, `\|` 파이프 |
-| `sed` | 출력/치환 스크립트의 좁은 형태를 벗어나는 것 전부 (`w FILE`과 `e`는 쓰기·실행) |
-| `git` | 읽기 전용 서브커맨드 집합 밖의 서브커맨드; `-c` (`core.pager`에 셸 명령을 넣을 수 있음); `--output`; `branch`/`remote`/`reflog`의 변경 동작 |
-| `jq` | `-f` `--rawfile` `--slurpfile` `-L` `--run-tests`; 프로그램 안의 `$ENV` / `include` / `import` |
-| `rg` | `--pre` `--pre-glob` `--hostname-bin` `-z` `--search-zip` |
-| `file` | `-m` `--magic-file` `-f` `--files-from` |
-| `fd` | `-x` `-X` `--exec` `--exec-batch` |
-| `tree` | `-o` |
-| `uniq` | 두 번째 피연산자 (출력 파일이다) |
-| `gh` | `GET`/`HEAD` 외의 메서드; 요청 필드(`-f`/`-F` — gh가 POST로 전환됨), 단 메서드가 명시적으로 GET이면 예외; `--input`; `graphql`; 읽기 전용 서브커맨드 집합 밖의 서브커맨드 |
+검사에는 방향이 둘 있다. **허용 목록**은 인정하는 것을 적고 나머지를 거부한다. **거부 목록**은 반대다. 앞의 것이 이 프로젝트의 편향과 같은 방향이라 기본으로 쓰지만, 안전한 표면이 너무 넓어 적어 내려갈 수 없는 곳에서는 거부 목록을 쓴다. `find`의 술어가 그렇다 — 위험한 것은 액션 여덟 개로 닫혀 있는데 무해한 것은 오십 개다.
+
+| 명령 | 방향 | 무엇을 본다 |
+|---|---|---|
+| `sed` | 허용 | 인정하는 스크립트 형태와 플래그만. `w FILE`과 `e`는 쓰기·실행이다 |
+| `git` | 허용 | 읽기 전용 서브커맨드 집합. `-c`는 `core.pager`에 셸 명령을 넣을 수 있어 거부 |
+| `gh` | 허용 | 읽기 전용 서브커맨드 집합, `GET`/`HEAD` 메서드만 |
+| `file` | 허용 | `-C`가 `magic.mgc`를 쓰고, `-S`는 file 자신의 seccomp 샌드박스를 끈다 |
+| `sort` | 허용 | `-o`는 파일을 쓰고 `--compress-program`은 프로그램을 실행한다 |
+| `awk` | 허용 | 플래그와 프로그램 본문 양쪽. gawk는 `-o` `-p` `-d`로 파일을 쓰고 `-l`로 공유 객체를 로드한다 |
+| `date` | 허용 | `+FORMAT` 아닌 피연산자는 시계 설정이다 (BSD는 플래그 없이 그렇게 한다) |
+| `find` | 거부 | `-exec` `-execdir` `-ok` `-okdir` `-delete` `-fprint*` `-fls` `-files0-from` |
+| `jq` | 거부 | `-f` `--rawfile` `--slurpfile` `-L` `--run-tests`; 프로그램 안의 `$ENV` / `include` / `import` |
+| `rg` | 거부 | `--pre` `--pre-glob` `--hostname-bin` `-z` `--search-zip` |
+| `fd` | 거부 | `-x` `-X` `--exec` `--exec-batch` |
+| `tree` | 거부 | `-o` |
+| `uniq` | 거부 | 두 번째 피연산자 (출력 파일이다) |
+
+`file` `sort` `awk` `date`가 허용 목록 쪽에 있는 이유는 넷 다 거부 목록으로 막다가 뚫렸기 때문이다. 넷의 공통점은 위험한 플래그가 액션처럼 생기지 않았다는 것이다 — `-C`는 이름만 보면 검사 옵션 같고, `--compress-program`은 성능 옵션 같다. 거부 목록은 그런 것을 미리 알아야만 막을 수 있다.
 
 `gh`는 따로 짚을 만하다. `gh api`는 GitHub API 전체에 대한 인증된 raw 클라이언트라, 할 수 있는 일이 곧 토큰의 스코프와 같다 — 흔한 `repo, workflow, gist, admin:public_key` 토큰이면 히스토리 재작성, `.github/workflows/*.yml` 쓰기(러너에서 저장소 시크릿을 쥔 채 임의 코드 실행), 계정에 SSH 키 추가가 전부 포함된다. `Bash(gh api *)` 같은 프리픽스 규칙으로는 "GET만"을 표현할 수 없고, 그래서 이 판정이 파서에 있어야 한다. 저장소 조사(`gh api repos/...`, `gh repo view`, `gh pr list`)는 통과하고, `gh api -X DELETE`, `gh repo create`, `gh pr merge`, `gh secret set`은 프롬프트로 간다.
 
@@ -56,6 +61,8 @@ Claude Code가 스스로 하는 검사를 그대로 따르는 줄 단위 규칙�
 - **`cd`가 두 번 이상**이면 거부한다 — 실효 작업 디렉터리를 따지기 어려워진다.
 
 `VAR=value cmd` 형태의 선행 대입은 로케일·포맷 관련 변수로 제한한다. 이게 없으면 `PAGER='sh -c "exec sh"' git log`가 셸 탈출이 된다. 대입만 있는 세그먼트(`n=${d%/}`)는 제한하지 않는다. 셸 변수를 설정할 뿐 아무것도 실행하지 않기 때문이다.
+
+`env`도 같은 검사를 받는다. `env PAGER=... git log`는 `PAGER=... git log`와 같은 것이고, 앞에 `env`가 붙었다고 달라지지 않는다. `env`의 플래그 역시 허용 목록이다 — `-S`는 피연산자를 통째로 명령줄로 쪼개고(`env -S"touch x"`가 touch를 실행한다) `-a`는 `argv[0]`을 갈아치워 검사받은 이름과 실행되는 것을 어긋나게 한다.
 
 `find` / `sort` / `sed` / `git` / `rg` 옆의 따옴표 없는 글롭은 거부한다. 글롭이 `-delete` 같은 파일명으로 확장될 수 있다. 따옴표로 감싼 글롭, 그리고 안전한 명령 옆의 글롭(`ls *.ts`, `cat *.md`)은 괜찮다.
 
@@ -160,12 +167,19 @@ bash 쪽 절반은 서브프로세스를 하나도 띄우지 않는다. `python3
 python3 tests/test_readonly_cmd.py
 ```
 
-allow 집합, 위에 적은 우회 기법들, 거부 로그, 그리고 회귀를 덮는 252개 케이스. 이 스위트가 잡아낸 버그 둘은 모두 명령을 잘못 *허용*하는 쪽이었다:
+allow 집합, 위에 적은 우회 기법들, 거부 로그, 그리고 회귀를 덮는 324개 케이스. 이 스위트가 잡아낸 버그 둘은 모두 명령을 잘못 *허용*하는 쪽이었다:
 
 - `printf ... | exec python3 ...` — 파이프라인 안의 `exec`는 스크립트가 아니라 서브셸을 대체하므로, 스크립트가 계속 진행해 무조건 허용 줄까지 내려가 `rm -rf`를 승인했다.
 - 토크나이저가 연산자 매칭보다 `isspace()`를 먼저 검사해서 개행이 공백으로 삼켜졌고, `ls\nrm -rf /tmp/x`가 `rm`을 인자로 가진 `ls`로 파싱됐다.
 
-allowlist를 넓힐 때는 양방향으로 케이스를 추가할 것.
+스위트가 놓친 것들도 있었다. 나중에 감사에서 나왔고, 하나는 스위트가 **적극적으로 감춘** 것이었다:
+
+- `env PAGER='sh -c "exec sh"' git log` — 맨 앞 대입은 검사받는데 `env` 뒤의 대입은 검사 없이 버려졌다. 같은 공격에 네 글자만 붙이면 됐다. 스위트가 `env FOO=bar ls`를 허용 케이스로 갖고 있어서, 우회가 살아 있는 한 회귀 테스트가 영원히 통과했다.
+- `env -S"touch pwned"` — 플래그를 다 떼고 나면 아무것도 안 남는데, 그것이 "맨몸 `env`"로 오인됐다.
+- `file -C`, `sort --compress-program=sh`, `awk -f prog.awk` — 셋 다 거부 목록이 몰랐던 플래그다.
+- `date -s`, `hostname pwned`, `/bin/../tmp/ls`.
+
+allowlist를 넓힐 때는 양방향으로 케이스를 추가할 것. 그리고 **허용 케이스가 우회를 박아두고 있지 않은지** 볼 것 — 위 첫 항목이 그 경우였고, 스위트가 초록불인 채로 몇 달을 갔다.
 
 ## 실세션 검증
 
