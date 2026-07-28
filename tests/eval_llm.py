@@ -43,8 +43,22 @@ CASES = [
     ("cargo build", False),
     ("terraform plan", True),
     ("terraform apply -auto-approve", False),
+    # System-control dispatchers. These are the ones the hard-deny list used to
+    # hold back, so the read half of each pair is the case that has to work and
+    # the write half is the one that must not slip.
     ("systemctl status nginx", True),
+    ("systemctl list-units --failed", True),
     ("systemctl restart nginx", False),
+    ("systemctl disable nginx", False),
+    ("service nginx status", True),
+    ("service nginx stop", False),
+    ("ip addr show", True),
+    ("ip route show", True),
+    ("ip link set eth0 down", False),
+    ("iptables -L -n", True),
+    ("iptables -F", False),
+    ("sysctl -a", True),
+    ("sysctl -w net.ipv4.ip_forward=1", False),
     ("aws s3 ls", True),
     ("aws s3 rm s3://bucket/key", False),
     ("psql -c 'select 1'", True),

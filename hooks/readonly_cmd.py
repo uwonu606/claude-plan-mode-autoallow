@@ -1053,31 +1053,34 @@ LLM_ENV = "PLAN_MODE_AUTOALLOW_LLM"
 LLM_ON = {"1", "on", "yes", "true"}
 
 # Names that never reach the classifier, however it might vote. This is the list
-# that decides how far a wrong answer can travel, and it holds two kinds of name.
+# that decides how far a wrong answer can travel, so the membership rule has to
+# be one thing rather than a feeling about each name.
 #
-# Most exist only to change something, so "read-only" is not a judgement call
-# there, it is a wrong answer. The rest -- systemctl, ip, iptables, sysctl --
-# do have reading subcommands, and by the rule above they belong with docker and
-# kubectl, out where the classifier can vote on them. They are held back anyway,
-# because the two mistakes are not the same size: a needless prompt for
-# `systemctl status` costs a keystroke, and a wrong yes for `systemctl stop`
-# has nothing behind it. The parser re-run cannot help -- the name is the whole
-# question there.
+# The rule: the name alone settles the question. `rm` is a deletion whatever
+# follows it, `sudo` is an escalation, `sh` runs whatever it is handed. Asking a
+# model about those is not a judgement call, and a yes is not a close call
+# either -- it is a wrong answer.
 #
-# Tools that merely *can* write are deliberately absent: `docker ps` is the case
-# the classifier exists for, and the re-run still guards the rest of the line.
+# Dispatchers are not on the list, and that includes the system-control ones.
+# `systemctl`, `ip`, `iptables`, `sysctl` name a subject, not an act: the verb
+# is the subcommand, and `systemctl status` is exactly as much a read as
+# `docker ps`. Holding them back was worth reconsidering because the reason
+# given -- that a wrong yes on `systemctl stop` is unusually bad -- does not
+# survive comparison with `docker system prune -f` or `kubectl delete`, which
+# the classifier already judges. Either the tier is trusted with dispatchers or
+# it is not; a line drawn between two equally destructive verbs is not a line.
+# tests/eval_llm.py measures that trust on read/write pairs for each of them.
 LLM_HARD_DENY = {
     "rm", "rmdir", "unlink", "shred", "dd", "mkfs", "mkswap", "wipefs",
     "fdisk", "parted", "sgdisk", "truncate", "tee", "install",
     "mv", "cp", "ln", "chmod", "chown", "chgrp", "touch", "mkdir",
     "kill", "pkill", "killall", "reboot", "shutdown", "halt", "poweroff",
-    "mount", "umount", "swapoff", "swapon", "sysctl", "modprobe", "insmod",
+    "mount", "umount", "swapoff", "swapon",
     "useradd", "userdel", "usermod", "groupadd", "passwd", "chpasswd",
     "visudo", "sudo", "su", "doas", "pkexec", "setcap", "setfacl",
     "sh", "bash", "zsh", "dash", "ksh", "fish", "eval", "exec", "source",
     "python", "python3", "perl", "ruby", "node", "php", "xargs",
-    "crontab", "at", "systemctl", "service", "launchctl",
-    "iptables", "nft", "ip", "ifconfig", "route",
+    "crontab", "at", "modprobe", "insmod", "rmmod",
 }
 
 # mkfs and fsck ship one binary per filesystem -- mkfs.ext4, fsck.xfs -- so the
