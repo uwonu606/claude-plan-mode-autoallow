@@ -38,8 +38,11 @@ auto 모드에서 빌려온 것은 판정 방식이 아니라 **계층 구조**�
 | 명령 | 방향 | 무엇을 본다 |
 |---|---|---|
 | `sed` | 허용 | 인정하는 스크립트 형태와 플래그만. `w FILE`과 `e`는 쓰기·실행이다 |
-| `git` | 허용 | 읽기 전용 서브커맨드 집합. `-c`는 `core.pager`에 셸 명령을 넣을 수 있어 거부 |
+| `git` | 허용 | 읽기 전용 서브커맨드 집합(`worktree`는 `list`만, `merge-base`는 순수 계산). `-c`는 `core.pager`에 셸 명령을 넣을 수 있어 거부 |
 | `gh` | 허용 | 읽기 전용 서브커맨드 집합, `GET`/`HEAD` 메서드만 |
+| `curl` | 허용 | `-o` `-O` `-D` `-c`는 파일을 쓰고, `-K`의 설정 파일은 `output=`을 품을 수 있고, `-d` `-F` `-T` `-X`는 변경 요청을 보낸다 |
+| `unzip` | 허용 | 목록 플래그(`-l` `-p` `-t` `-z` `-v` `-Z` `-c`)가 없으면 기본 동작이 추출이라 거부. `-d`는 위치와 무관하게 거부 |
+| `javap` | 허용 | `-J`는 옵션을 JVM으로 넘긴다(`-J-javaagent:...`) |
 | `file` | 허용 | `-C`가 `magic.mgc`를 쓰고, `-S`는 file 자신의 seccomp 샌드박스를 끈다 |
 | `sort` | 허용 | `-o`는 파일을 쓰고 `--compress-program`은 프로그램을 실행한다 |
 | `awk` | 허용 | 플래그와 프로그램 본문 양쪽. gawk는 `-o` `-p` `-d`로 파일을 쓰고 `-l`로 공유 객체를 로드한다 |
@@ -55,12 +58,19 @@ auto 모드에서 빌려온 것은 판정 방식이 아니라 **계층 구조**�
 
 `gh`는 따로 짚을 만하다. `gh api`는 GitHub API 전체에 대한 인증된 raw 클라이언트라, 할 수 있는 일이 곧 토큰의 스코프와 같다 — 흔한 `repo, workflow, gist, admin:public_key` 토큰이면 히스토리 재작성, `.github/workflows/*.yml` 쓰기(러너에서 저장소 시크릿을 쥔 채 임의 코드 실행), 계정에 SSH 키 추가가 전부 포함된다. `Bash(gh api *)` 같은 프리픽스 규칙으로는 "GET만"을 표현할 수 없고, 그래서 이 판정이 파서에 있어야 한다. 저장소 조사(`gh api repos/...`, `gh repo view`, `gh pr list`)는 통과하고, `gh api -X DELETE`, `gh repo create`, `gh pr merge`, `gh secret set`은 프롬프트로 간다.
 
-무조건 거부: `/dev/null` 계열이 아닌 대상으로의 출력 리다이렉션, 히어독, 프로세스 치환, 백틱, 간접 실행(`$CMD`, `eval`), 인터프리터(`python3 -c`, `bash script.sh`), `xargs`, 그리고 목록에 없는 모든 명령.
+무조건 거부: `/dev/null` 계열이 아닌 대상으로의 출력 리다이렉션, 히어독, 프로세스 치환, 백틱, 간접 실행(`$CMD`, `eval`), 그리고 목록에 없는 모든 명령.
 
-Claude Code가 스스로 하는 검사를 그대로 따르는 줄 단위 규칙이 둘 있다:
+목록에 없는 것 중에서도 **이름만으로 판정이 끝나는 것**은 따로 답한다. `rm`은 뒤에 뭐가 오든 삭제고, `python3`·`bash`·`xargs`는 무엇을 실행할지 줄에서 보이지 않는다. 이런 이름은 `known write/exec command`로 거부하고, `command not on read-only allowlist`는 **정말 처음 보는 이름**에만 남긴다. 두 판정을 가르는 기준은 하나다 — 이름 하나로 답이 정해지는가. `docker`나 `kubectl`은 주체를 가리킬 뿐 동사가 서브커맨드에 있어서 뒤쪽에 남는다. 미해결 명령 목록에서 답이 이미 정해진 것을 걷어내는 게 이 구분의 값이다.
 
-- **`cd` 다음 `git`** 은 거부한다 — git은 대상 디렉터리의 hook과 fsmonitor를 실행할 수 있다.
+줄 단위 규칙이 둘 있다:
+
 - **`cd`가 두 번 이상**이면 거부한다 — 실효 작업 디렉터리를 따지기 어려워진다.
+- **`cd` 다음 `git`** 은 대상 저장소를 검사한다. git은 대상 디렉터리의 설정과 hook을 실행할 수 있으니 위협은 실재하는데, 로그를 보면 이 규칙에 걸린 명령은 전부 읽기였다. 그래서 거부 대신 확인한다. 셋 다 통과해야 자동 허용한다:
+  1. **동사** — `fetch` `ls-remote` `remote`처럼 remote 설정을 읽는 동사가 줄에 있으면 거부한다. `remote.<name>.url`의 `ext::sh -c …`가 실행되는 경로가 그것뿐이라, 이 하나로 `remote` 섹션 전체를 검사에서 뺄 수 있다.
+  2. **대상** — `cd` 대상이 단일 리터럴 경로여야 한다. 변수·글롭·인자 없는 `cd`는 어디로 가는지 말할 수 없으므로 거부한다. 상대 경로는 훅이 받은 `cwd`로 푼다.
+  3. **저장소** — 대상의 로컬 config를 읽어 **git이 값을 읽는 섹션**(`core` `alias` `include` `diff` `filter` `credential` `url` …) 안의 키가 전부 무해 목록에 있는지 보고, 실행 가능한 `post-index-change` 훅이 없는지 본다. 하나라도 확인할 수 없으면(디렉터리가 사라졌거나, git 저장소가 아니거나, 타임아웃) 거부한다.
+
+  검사 단위가 키가 아니라 **섹션**인 이유는 실측이다. 실저장소의 로컬 config에는 `branch.<n>.vscode-merge-base`, `lfs.*`처럼 서드파티가 찍은 키가 늘 섞여 있어서, 무해 키만 열거하면 자동 허용이 0건이 된다. git은 자기 네임스페이스만 읽으므로 남이 찍은 키는 실행 경로가 아니다. 훅을 `post-index-change` 하나로 좁힌 것도 실측이다 — 훅 26개를 설치한 저장소에 읽기 동사 23개를 돌려 `git status`만 그 훅을 발화시키는 것을 확인했다. 자세한 근거는 [ADR-0002](docs/adr/0002-inspect-the-target-repo-before-cd-then-git.md).
 
 `VAR=value cmd` 형태의 선행 대입은 로케일·포맷 관련 변수로 제한한다. 이게 없으면 `PAGER='sh -c "exec sh"' git log`가 셸 탈출이 된다. 대입만 있는 세그먼트(`n=${d%/}`)는 제한하지 않는다. 셸 변수를 설정할 뿐 아무것도 실행하지 않기 때문이다.
 
@@ -93,7 +103,7 @@ Claude Code가 스스로 하는 검사를 그대로 따르는 줄 단위 규칙�
 
 **실패는 전부 프롬프트로 수렴한다.** 바이너리가 없든, 네트워크가 끊겼든, 타임아웃이든, 응답을 못 읽든 승인이 안 나가고 평소 흐름으로 넘어간다. 이 계층은 프롬프트를 없앨 수만 있고, 실수로 건너뛰게 만들 수는 없다.
 
-허용 판정은 `allowed.jsonl`에 쌓인다. 캐시이면서 동시에 정적 규칙 승격 후보 목록이다 — 여기 같은 명령어가 반복되면 파서에 넣을 때가 된 것이다. 대가는 오판 하나가 영속한다는 것이고, 그 대신 같은 줄이 오늘과 내일 다르게 판정되지 않는다. 지우면 다시 묻는다.
+분류기의 허용 판정도 판정 로그에 `allowed by classifier` 규칙으로 쌓인다. 캐시이면서 동시에 승격 후보 목록이다 — `--report`가 이 판정만 골라 명령어별로 묶어주고, 같은 명령어가 반복되면 파서에 넣을 때가 된 것이다. 대가는 오판 하나가 영속한다는 것이고, 그 대신 같은 줄이 오늘과 내일 다르게 판정되지 않는다. 캐시가 무엇을 판정했는지는 명령 본문으로 확인하므로, 본문이 `bodies/`에서 정리된 줄은 캐시 적중이 아니라 재질의가 된다.
 
 | | |
 |---|---|
@@ -139,29 +149,50 @@ cd claude-plan-mode-autoallow
 
 `settings.example.json`의 `permissions.allow` / `permissions.deny` 블록도 한 번 읽어볼 만하다. allow 항목은 *일반* 모드에서도 프롬프트를 줄이고, deny 항목은 자격증명 파일을 읽지 못하게 막는다.
 
-## 거부 로그
+## 판정 로그
 
-default deny라는 건 allowlist가 영원히 완성되지 않는다는 뜻이다 — 아직 못 본 읽기 전용 명령이 항상 남아 있다. 그래서 파서가 거부한 plan mode Bash 명령은 거부한 규칙과 함께 적립된다:
+default deny라는 건 allowlist가 영원히 완성되지 않는다는 뜻이다 — 아직 못 본 읽기 전용 명령이 항상 남아 있다. 그래서 자동 허용되지 않은 plan mode Bash 명령은 그때 걸린 규칙과 함께 적립된다:
 
 ```
 ~/.claude/plan-mode-autoallow/
-├─ README.md        install.sh가 쓴다. 이 디렉터리가 뭔지, --report를 어떻게 돌리는지
-├─ denied.jsonl
-├─ denied.jsonl.1   2 MB 넘으면 밀려난 이전 파일
-└─ allowed.jsonl    LLM 계층을 켰을 때만. 위의 "모르는 명령" 절 참조
+├─ README.md          install.sh가 쓴다. 이 디렉터리가 뭔지, --report를 어떻게 돌리는지
+├─ judgments.jsonl    판정 한 줄씩. append-only, 로테이션 없음
+├─ bodies/<ref>       명령 본문. 여기에만 2 MB 상한이 걸린다
+└─ denied.jsonl.0     이관 전 옛 로그 보관본 (allowed.jsonl.0도 같이)
 ```
 
-두 파일이 답하는 질문이 다르다. `denied.jsonl`은 **아무도 허용하지 않은 것**이라 쓰기 명령이거나 아직 아무도 판단할 수 없는 것이고, `allowed.jsonl`은 **분류기는 읽기라고 했는데 파서가 표현하지 못한 것**이라 정적 규칙으로 승격할 후보다.
+**판정 축으로 파일을 가르지 않는다.** 허용이냐 거부냐는 훅이 이미 아는 축이고, 정보를 나르는 축은 따로 있다 — 파서가 **쓰기임을 입증한 것**(리다이렉션, 히어독, `known write/exec command`)과 **모른다고 자백한 것**(모르는 이름, 검사할 수 없었던 `cd` 대상). 파서를 넓힐 근거는 뒤엣것뿐이다. 그런데 이 구분은 저장할 것이 아니라 읽을 때 계산할 것이다. 규칙 하나를 승격하면 관련 줄이 저절로 빠져야 하는데, 파일로 갈라두면 주기마다 손으로 골라내야 한다.
+
+그래서 원시연산은 하나다 — `replay(records)`가 저장된 명령을 **지금 파서로 다시 판정한다.** 아래 넷은 전부 그것의 얇은 호출자다.
+
+| | |
+|---|---|
+| `--report` | 재생 판정을 규칙별로 집계하고, 이어서 승격 후보를 명령어별로 묶는다 |
+| `--open` | 미해결 명령만. 매 주기 무엇을 읽을지 정하는 목록 |
+| `--regress` | 저장 판정과 재생 판정을 비교한다. 파서를 고친 뒤 무엇이 열리고 무엇이 막혔는지 |
+| `--migrate` | 옛 `denied.jsonl`/`allowed.jsonl`을 접어 넣는다. 재생이 이미 자동 허용하는 줄은 옮기지 않는다 |
 
 로그를 훅 옆이 아니라 자기 디렉터리에 두는 이유는, 이 파일이 맥락 없이 발견되는 유일한 파일이기 때문이다. 몇 달 뒤 다른 걸 찾다가 `~/.claude`를 뒤지던 사람이 마주치는 자리에 설명이 같이 있어야 한다.
 
-레코드 한 줄:
+판정 한 줄:
 
 ```json
-{"ts":"2026-07-26T18:36:28+0900","rule":"command not on read-only allowlist","detail":"docker","reason":"command not on read-only allowlist: 'docker'","command":"docker ps","cwd":"/srv/project"}
+{"ts":"2026-07-26T18:36:28+0900","rule":"command not on read-only allowlist","detail":"docker","cwd":"/srv/project","head":"docker ps","ref":"3a1f0c9d2b7e4a58","bytes":9}
 ```
 
-`rule`과 `detail`이 나뉘어 있는 게 핵심이다. 파서의 거부 메시지는 대부분 값을 품는다 — `output redirection to 'a.txt'`, `find -delete`. 이걸 한 문장으로 저장하면 파일명 하나마다 별개의 버킷이 생겨서, 정작 이 로그를 읽는 이유인 *어느 규칙이 제일 자주 걸리나*에 답할 수 없다. `rule`은 값이 빠진 고정 문자열이라 집계 키가 되고, `detail`은 그 안에서 다시 묶인다. `reason`은 둘을 합친 문장인데, 이 파일을 처음 보는 방법이 대개 `tail`이기 때문에 남겨둔다.
+| 필드 | 뜻 |
+|---|---|
+| `ts` | 시각 (ISO 8601) |
+| `rule` | 걸린 규칙. **값이 들어가지 않는 고정 문자열이라 집계 키로 쓴다** |
+| `detail` | 그 규칙을 건드린 값 (`docker`, `-i`, `a.txt` …) |
+| `cwd` | 실행하려던 디렉터리 (있을 때만) |
+| `head` | 본문 첫 줄 앞 160자. `tail`로 훑을 때 읽을 것 |
+| `ref` | `bodies/` 안의 본문 파일 이름 |
+| `bytes` | 본문 길이 |
+
+`rule`과 `detail`이 나뉘어 있는 게 핵심이다. 파서의 거부 메시지는 대부분 값을 품는다 — `output redirection to 'a.txt'`, `find -delete`. 이걸 한 문장으로 저장하면 파일명 하나마다 별개의 버킷이 생겨서, 정작 이 로그를 읽는 이유인 *어느 규칙이 제일 자주 걸리나*에 답할 수 없다. `rule`은 값이 빠진 고정 문자열이라 집계 키가 되고, `detail`은 그 안에서 다시 묶인다.
+
+명령 본문이 줄 밖에 있는 이유는 둘이다. 한 줄이 470 B로 줄어 **원본에 로테이션을 걸지 않아도 되고**(하루 12.1건이면 연 2.1 MB다), 부피와 민감도가 `bodies/`로 모여 상한을 거기에만 걸 수 있다. 로그가 로그일 때는 로테이션이 무해했지만, 회귀 스위트가 된 뒤로는 아니다 — 2 MB에서 밀어내고 `.1`을 덮어쓰면 두 주기 만에 가장 오래된 판정이 사라진다.
 
 집계해서 보려면:
 
@@ -170,40 +201,42 @@ python3 hooks/readonly_cmd.py --report
 ```
 
 ```
-9  command not on read-only allowlist
-   npm×2  rm×2  docker×1  python3×1  cargo×1  make×1  (+1 more)
-3  output redirection to
-   a.txt×1  b.txt×1  c.txt×1
-2  gh
-   pr merge×1  repo delete×1
+217 judgments, 2026-07-26T17:49:54+0900 .. 2026-08-17T17:52:28+0900
+replayed: 0 auto-allowed, 217 refused in 21 rules (57 open, 0 body collected)
+
+   51  known write/exec command
+       python3×31  mkdir×8  node×7  touch×2  xargs×2  rm×1
+   47  output redirection to
+       …
+   41  command not on read-only allowlist
+       glab×9  export×7  docker×6  ollama×6  continue×3  read×3  (+5 more)
 ```
 
-규칙별 건수와 규칙 안의 값별 건수가 같이 나온다. 첫 줄이 `command not on read-only allowlist`이고 `detail`에 같은 명령이 반복되면 allowlist에 넣을 후보다. 로테이션된 `.1`도 같이 읽는다 — 오래 모인 데이터가 거기 있다.
+건수는 **저장된 판정이 아니라 재생 판정**이다. 지난달에 파서가 뭐라고 했는지는 역사이고, 승격이 움직여야 하는 것은 지금 뭐라고 하는지다. 이어서 나오는 승격 후보 목록의 집계 키가 규칙이 아니라 **명령어 이름**인 이유도 같다 — 파서에 실제로 추가하게 되는 단위가 그것이다.
 
-`allowed.jsonl`이 있으면 이어서 명령어별로 묶어 보여준다. 이쪽 집계 키가 규칙이 아니라 **명령어 이름**인 이유는, 파서에 실제로 추가하게 되는 단위가 그것이기 때문이다:
+`--open`은 그중 **파서가 모른다고 자백한 것만** 보여준다. 어느 규칙이 자백인지는 목록으로 박혀 있다:
 
 ```
-6 classifier verdicts, 3 commands -- candidates to teach the parser:
-
-    4  docker
-       docker images
-       docker logs web
-       docker ps
-       (+1 more)
-    1  kubectl
-       kubectl get pods
+command not on read-only allowlist          모르는 이름
+git / gh                                    읽기 집합에 없는 서브커맨드
+git branch operand                          표현 못 하는 목록 형태
+cd before git: target repo unreadable       검사할 수 없었다 (fail closed)
+cd before git: cd target not identifiable   어디로 가는지 말할 수 없다
+cd before git: network-touching git verb    위협을 확인하지 못한 채 거부
 ```
 
-`docker`가 네 번 올라왔다는 건 이제 `check_docker`를 쓸 때가 됐다는 뜻이다. 쓰고 나면 그 줄들은 파서에서 ~14 ms에 끝나고 분류기를 부르지 않는다.
+리다이렉션도, 히어독도, `known write/exec command`도 여기 없다. 그건 파서가 답을 아는 것들이고, 매 주기 다시 읽으면 정작 질문인 것들이 그 밑에 묻힌다.
+
+`git`과 `gh` 둘은 거칠다. 규칙 문자열은 서브커맨드를 뺀 나머지라 `git frobnicate`(질문)와 `git push`(질문 아님)를 한 버킷에 담는다. 둘을 가르려면 두 도구의 쓰기 서브커맨드를 열거해야 하는데, 그 열거를 피하려고 읽기 집합을 두는 것이다. 그래서 이 버킷은 `detail` 열을 보고 읽는다.
 
 | | |
 |---|---|
 | 경로 | `PLAN_MODE_AUTOALLOW_LOG=/some/path`, 끄려면 `off`. `CLAUDE_CONFIG_DIR`이 설정돼 있으면 그 아래를 기본값으로 쓴다. 없는 상위 디렉터리는 만든다. |
-| 로테이션 | 2 MB에서 `.jsonl.1`로 이름을 바꾸고 새로 시작한다. 한꺼번에 몰려도 정작 들여다보게 만든 항목을 버리지 않는다. |
+| 로테이션 | `judgments.jsonl`에는 없다. `bodies/`만 2 MB를 넘으면 오래된 본문부터 지운다. 본문이 지워져도 판정 줄은 남고, 재생은 `body unavailable`로 답한다. |
 | 권한 | 디렉터리 `0700`, 파일 `0600`. 명령줄 전체가 들어가므로 셸 히스토리처럼 다뤄야 한다. |
-| 실패 | 쓸 수 없는 로그는 무시한다. 권한 판정을 바꾸거나 막는 일은 절대 없다. |
+| 실패 | 쓸 수 없는 로그는 무시한다. 판정을 바꾸거나 막는 일은 절대 없다. |
 
-읽을 때 주의할 점 하나. 로그에 있다고 해서 그 명령이 실행되지 않은 건 아니다. 훅이 침묵하면 판정이 평소 흐름으로 넘어가고, 거기서 `permissions.allow` 규칙이나 세션 중 승인이 덮을 수 있다. 실세션 검증에서 실제로 그렇게 됐다 — 훅이 승인하지 않은 `ollama pull …`이 `denied.jsonl`에 남았는데도 프롬프트 없이 실행됐다. 이 로그는 *이 훅이* 승인하지 않은 명령의 집합이지 차단된 명령의 집합이 아니고, 검토할 가치가 있는 것은 그래도 그 집합이다.
+읽을 때 주의할 점 하나. 로그에 있다고 해서 그 명령이 실행되지 않은 건 아니다. 훅이 침묵하면 판정이 평소 흐름으로 넘어가고, 거기서 `permissions.allow` 규칙이나 세션 중 승인이 덮을 수 있다. 실세션 검증에서 실제로 그렇게 됐다 — 훅이 자동 허용하지 않은 `ollama pull …`이 로그에 남았는데도 프롬프트 없이 실행됐다. 이 로그는 *이 훅이* 자동 허용하지 않은 명령의 집합이지 실행되지 않은 명령의 집합이 아니고, 검토할 가치가 있는 것은 그래도 그 집합이다.
 
 ## 비용
 
@@ -224,7 +257,7 @@ bash 쪽 절반은 서브프로세스를 하나도 띄우지 않는다. `python3
 python3 tests/test_readonly_cmd.py
 ```
 
-allow 집합, 위에 적은 우회 기법들, 거부 로그, 그리고 회귀를 덮는 346개 케이스. 이 스위트가 잡아낸 버그 둘은 모두 명령을 잘못 *허용*하는 쪽이었다:
+allow 집합, 위에 적은 우회 기법들, 판정 로그, 그리고 회귀를 덮는 466개 케이스. `cd` 뒤 git 검사는 임시 디렉터리에 실제 저장소를 만들어 확인한다 — 검사가 읽는 것이 실제 저장소라 스텁을 두면 스텁을 시험하게 된다. 이 스위트가 잡아낸 버그 둘은 모두 명령을 잘못 *허용*하는 쪽이었다:
 
 - `printf ... | exec python3 ...` — 파이프라인 안의 `exec`는 스크립트가 아니라 서브셸을 대체하므로, 스크립트가 계속 진행해 무조건 허용 줄까지 내려가 `rm -rf`를 승인했다.
 - 토크나이저가 연산자 매칭보다 `isspace()`를 먼저 검사해서 개행이 공백으로 삼켜졌고, `ls\nrm -rf /tmp/x`가 `rm`을 인자로 가진 `ls`로 파싱됐다.
