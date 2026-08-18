@@ -53,6 +53,48 @@ GIT_READ_SUBCOMMANDS = {
     "show-ref", "count-objects", "var", "whatchanged", "check-ignore",
     "worktree", "merge-base",
 }
+# The same test KNOWN_EXECUTORS applies, one level down: does the name settle
+# the verdict on its own? `git fetch` moves refs whatever follows it, the way
+# `rm` deletes whatever follows it -- that `--dry-run` exists no more makes
+# `push` a reader than `python3 -c "print(1)"` makes python3 one. Without this
+# the parser said only "git: fetch", the same sentence it says for a subcommand
+# it has never heard of, and a settled write sat in the unresolved pile every
+# cycle. Names with an ordinary read form are deliberately absent -- `git tag`
+# lists tags, `git stash list` and `git submodule status` read -- because
+# calling those writes would bury a real promotion question.
+GIT_WRITE_SUBCOMMANDS = {
+    "add", "am", "checkout", "cherry-pick", "clean", "clone", "commit",
+    "commit-tree", "fast-import", "fetch", "filter-branch", "gc", "init",
+    "merge", "mktree", "mv", "prune", "pull", "push", "rebase", "repack",
+    "reset", "restore", "revert", "rm", "switch", "update-index",
+    "update-ref", "write-tree",
+}
+
+# gh names the act in the second word, so the pair is what settles it.
+GH_WRITE_ACTIONS = {
+    "auth": {"login", "logout", "switch", "refresh", "setup-git", "token"},
+    "pr": {"create", "merge", "close", "reopen", "edit", "review", "comment",
+           "ready", "checkout", "lock", "unlock"},
+    "issue": {"create", "close", "reopen", "edit", "comment", "delete",
+              "pin", "unpin", "transfer", "lock", "unlock"},
+    "repo": {"create", "delete", "fork", "clone", "edit", "rename",
+             "archive", "unarchive", "sync", "deploy-key"},
+    "release": {"create", "delete", "edit", "upload", "download"},
+    "secret": {"set", "delete"},
+    "variable": {"set", "delete"},
+    "workflow": {"run", "enable", "disable"},
+    "run": {"rerun", "cancel", "delete", "download"},
+    "gist": {"create", "delete", "edit", "clone"},
+    "label": {"create", "delete", "edit", "clone"},
+    "cache": {"delete"},
+    "alias": {"set", "delete", "import"},
+    "config": {"set"},
+    "extension": {"install", "remove", "upgrade", "create"},
+    "codespace": {"create", "delete", "stop", "rebuild", "edit"},
+    "ssh-key": {"add", "delete"},
+    "gpg-key": {"add", "delete"},
+}
+
 GIT_FLAGS_WITH_VALUE = {"-C", "--git-dir", "--work-tree", "--namespace"}
 GIT_BRANCH_MUTATE = {"-d", "-D", "-m", "-M", "-c", "-C", "-f", "--delete",
                      "--move", "--copy", "--force", "--unset-upstream",
@@ -976,6 +1018,9 @@ def check_gh(args):
     if sub == "api":
         return check_gh_api(rest)
     if sub not in GH_READ_SUBCOMMANDS:
+        act = next((unquote(a) for a in rest if not a.startswith("-")), None)
+        if act in GH_WRITE_ACTIONS.get(sub, ()):
+            raise Deny("known write/exec gh subcommand: %s %s", sub, act)
         raise Deny("gh %s", sub)
 
     allowed = GH_READ_SUBCOMMANDS[sub]
@@ -983,6 +1028,8 @@ def check_gh(args):
         return  # `gh status`, `gh version`
     action = next((unquote(a) for a in rest if not a.startswith("-")), None)
     if action not in allowed:
+        if action in GH_WRITE_ACTIONS.get(sub, ()):
+            raise Deny("known write/exec gh subcommand: %s %s", sub, action)
         raise Deny("gh %s %s", sub, action)
 
 
@@ -1053,6 +1100,8 @@ def check_git(args):
     # every git on the line, `-C <path>` forms included.
     SEEN_GIT_SUBCOMMANDS.append(unquote(sub))
     if sub not in GIT_READ_SUBCOMMANDS:
+        if unquote(sub) in GIT_WRITE_SUBCOMMANDS:
+            raise Deny("known write/exec git subcommand: %s", unquote(sub))
         raise Deny("git %s", sub)
 
     if sub == "config":

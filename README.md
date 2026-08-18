@@ -218,16 +218,16 @@ replayed: 0 auto-allowed, 217 refused in 21 rules (57 open, 0 body collected)
 
 ```
 command not on read-only allowlist          모르는 이름
-git / gh                                    읽기 집합에 없는 서브커맨드
+git / gh                                    처음 보는 서브커맨드
 git branch operand                          표현 못 하는 목록 형태
 cd before git: target repo unreadable       검사할 수 없었다 (fail closed)
 cd before git: cd target not identifiable   어디로 가는지 말할 수 없다
 cd before git: network-touching git verb    위협을 확인하지 못한 채 거부
 ```
 
-리다이렉션도, 히어독도, `known write/exec command`도 여기 없다. 그건 파서가 답을 아는 것들이고, 매 주기 다시 읽으면 정작 질문인 것들이 그 밑에 묻힌다.
+리다이렉션도, 히어독도, `known write/exec command`와 그 서브커맨드 짝도 여기 없다. 그건 파서가 답을 아는 것들이고, 매 주기 다시 읽으면 정작 질문인 것들이 그 밑에 묻힌다.
 
-`git`과 `gh` 둘은 거칠다. 규칙 문자열은 서브커맨드를 뺀 나머지라 `git frobnicate`(질문)와 `git push`(질문 아님)를 한 버킷에 담는다. 둘을 가르려면 두 도구의 쓰기 서브커맨드를 열거해야 하는데, 그 열거를 피하려고 읽기 집합을 두는 것이다. 그래서 이 버킷은 `detail` 열을 보고 읽는다.
+`git`과 `gh`에도 같은 구분이 한 단계 아래로 적용된다. `git fetch`는 뒤에 뭐가 오든 refs를 옮기므로 `known write/exec git subcommand`로 거부하고, `gh auth switch`는 `known write/exec gh subcommand`로 거부한다. `git frobnicate`처럼 정말 처음 보는 서브커맨드만 `git` 버킷에 남는다. 여기서도 열거하는 것은 **쓰기 서브커맨드 전부가 아니라 이름만으로 답이 정해지는 것들**이다 — `git tag`는 태그를 나열하고 `git stash list`와 `git submodule status`는 읽으므로 일부러 빠져 있다. 그것들을 쓰기라고 부르면 승격할지 말지의 질문이 목록에서 사라진다.
 
 | | |
 |---|---|

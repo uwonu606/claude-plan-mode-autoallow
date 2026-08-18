@@ -494,6 +494,53 @@ for _cmd, _rule, _detail in KNOWN_EXEC:
 print("known exec: %d/%d passed" % (len(KNOWN_EXEC) - known_fail,
                                     len(KNOWN_EXEC)))
 
+
+# --- appended: the same move one level down. `Deny("git %s", sub)` was pooling
+# --- two different sentences -- "I do not know this subcommand" and "I know
+# --- this one writes" -- under one rule, so `git fetch` sat in the unresolved
+# --- pile forever, exactly where `python3` used to sit. Names whose write
+# --- class is settled get their own verdict; names with an ordinary read form
+# --- (`git tag`, `git stash list`, `git submodule status`) stay unresolved,
+# --- because saying "write" there would bury a real promotion question.
+KNOWN_SUB = [
+    ("git fetch origin", "known write/exec git subcommand", "fetch"),
+    ("git push origin main", "known write/exec git subcommand", "push"),
+    ("git commit -m x", "known write/exec git subcommand", "commit"),
+    ("git checkout -b b", "known write/exec git subcommand", "checkout"),
+    ("git -C /srv/x fetch", "known write/exec git subcommand", "fetch"),
+    ("git tag", "git", "tag"),
+    ("git stash list", "git", "stash"),
+    ("git submodule status", "git", "submodule"),
+    ("gh auth switch", "known write/exec gh subcommand", "auth switch"),
+    ("gh pr merge 3", "known write/exec gh subcommand", "pr merge"),
+    ("gh repo create x", "known write/exec gh subcommand", "repo create"),
+    ("gh codespace list", "gh", "codespace"),
+]
+sub_fail = 0
+for _cmd, _rule, _detail in KNOWN_SUB:
+    _v = rc.explain(_cmd)
+    if not _v or _v["rule"] != _rule or _v["detail"] != _detail:
+        print("FAIL (known sub, want %r/%r): %r -> %r"
+              % (_rule, _detail, _cmd, _v))
+        sub_fail += 1
+print("known sub: %d/%d passed" % (len(KNOWN_SUB) - sub_fail, len(KNOWN_SUB)))
+
+# The point of the split: a settled write must not be an open question.
+open_checks = []
+for _cmd in ("git fetch origin", "git push origin main", "gh auth switch"):
+    open_checks.append(("%s is not an open question" % _cmd,
+                        rc.explain(_cmd)["rule"] not in rc.OPEN_RULES))
+for _cmd in ("git tag", "docker ps"):
+    open_checks.append(("%s stays an open question" % _cmd,
+                        rc.explain(_cmd)["rule"] in rc.OPEN_RULES))
+open_fail = 0
+for _label, _ok in open_checks:
+    if not _ok:
+        print("FAIL (open bucket): %s" % _label)
+        open_fail += 1
+print("open bucket: %d/%d passed" % (len(open_checks) - open_fail,
+                                     len(open_checks)))
+
 # --- appended: `cd` before `git` is no longer refused outright. The target
 # --- repository is inspected instead -- local config, git verb, and the one
 # --- hook a read verb can fire -- and anything that cannot be inspected is
@@ -1084,9 +1131,11 @@ print("llm: %d/%d passed" % (len(llm_checks) - llm_fail, len(llm_checks)))
 
 
 total = (len(ALLOW) + len(DENY) + len(EXTRA) + len(HARDENING) + len(GH)
-         + _tools + len(GITPROMOTE) + len(KNOWN_EXEC) + len(cdgit_checks)
+         + _tools + len(GITPROMOTE) + len(KNOWN_EXEC)
+         + len(KNOWN_SUB) + len(open_checks) + len(cdgit_checks)
          + len(log_checks) + len(llm_checks))
 total_fail = (fails + extra_fail + hard_fail + gh_fail + tool_fail
-              + promote_fail + known_fail + cdgit_fail + log_fail + llm_fail)
+              + promote_fail + known_fail + sub_fail + open_fail
+              + cdgit_fail + log_fail + llm_fail)
 print("TOTAL: %d/%d passed" % (total - total_fail, total))
 sys.exit(1 if total_fail else 0)
