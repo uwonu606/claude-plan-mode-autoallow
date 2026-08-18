@@ -67,6 +67,7 @@ ALLOW = [
     "git config --list",
     "git status\ngit log\nls",
     "ls\n\n  \n grep x y",
+    "curl http://example.com",
 ]
 
 DENY = [
@@ -86,7 +87,6 @@ DENY = [
     "sort -o f f",
     "./scripts/check.sh",
     "npm install",
-    "curl http://example.com",
     "git push",
     "git commit -m x",
     "git checkout main",
@@ -370,6 +370,283 @@ for _cmd, _want in GH:
         gh_fail += 1
 print("gh: %d/%d passed" % (len(GH) - gh_fail, len(GH)))
 
+# --- appended: `javap`, `unzip` and `curl`. All three carry flags that keep
+# --- working after an operand (`curl URL -o f`), so the flag walk has to scan
+# --- the whole line instead of stopping at the first non-flag word.
+JAVAP = [
+    ("javap Foo", True),
+    ("javap -c Foo", True),
+    ("javap -p -c com.example.Foo", True),
+    ("javap -verbose Foo", True),
+    ("javap -cp build/classes Foo", True),
+    ("javap -classpath /tmp/x.jar com.example.Foo | head -40", True),
+    ("javap --class-path build Foo", True),
+    ("javap -c -p Foo Bar", True),
+    # -J hands an option straight to the JVM, which is an execution vector.
+    ("javap -J-javaagent:/tmp/evil.jar Foo", False),
+    ("javap Foo -J-Xmx1g", False),
+    ("javap -cp", False),
+    ("javap -o out Foo", False),
+    ("javap --module-path", False),
+]
+
+UNZIP = [
+    ("unzip -l x.zip", True),
+    ("unzip -p x.zip README.md | head", True),
+    ("unzip -v x.zip", True),
+    ("unzip -t x.zip", True),
+    ("unzip -Z x.zip", True),
+    ("unzip -c x.zip f.txt", True),
+    ("unzip -l x.zip -x '*.png'", True),
+    ("unzip -lq x.zip", True),
+    # No list flag means it extracts, quietly or not.
+    ("unzip x.zip", False),
+    ("unzip -q x.zip", False),
+    ("unzip -o x.zip", False),
+    ("unzip -d /tmp x.zip", False),
+    # -d after the operand still picks the extraction directory.
+    ("unzip -l x.zip -d /tmp", False),
+    ("unzip -ld /tmp x.zip", False),
+]
+
+CURL = [
+    ("curl https://example.com", True),
+    ("curl -sSL https://example.com | head", True),
+    ("curl -s https://api.github.com/rate_limit | jq .", True),
+    ("curl -I https://example.com", True),
+    ("curl -fsS -H 'Accept: application/json' https://x/y", True),
+    ("curl --compressed --max-time 5 https://x", True),
+    ("curl -o /tmp/f https://example.com", False),
+    ("curl https://example.com -o /tmp/f", False),
+    ("curl -O https://example.com/f.tar", False),
+    ("curl --output-dir /tmp -O https://x/f", False),
+    ("curl -X GET https://example.com", False),
+    ("curl -X POST -d 'a=1' https://x", False),
+    ("curl -T f.txt https://x", False),
+    ("curl -D /tmp/h https://x", False),
+    ("curl -c /tmp/jar https://x", False),
+    ("curl -K /tmp/curlrc https://x", False),
+    ("curl --data-binary @f https://x", False),
+    ("curl -F file=@f https://x", False),
+    ("curl --trace /tmp/t https://x", False),
+    ("curl --etag-save /tmp/e https://x", False),
+]
+
+tool_fail = 0
+for _name, _table in (("javap", JAVAP), ("unzip", UNZIP), ("curl", CURL)):
+    for _cmd, _want in _table:
+        if is_read_only(_cmd) != _want:
+            print("FAIL (%s, want %s): %r" % (_name, _want, _cmd))
+            tool_fail += 1
+_tools = len(JAVAP) + len(UNZIP) + len(CURL)
+print("tools: %d/%d passed" % (_tools - tool_fail, _tools))
+
+# --- appended: `worktree list` and `merge-base` promoted to the git read set.
+# --- `git -C <path>` is walked by the existing flag loop, so the promotion has
+# --- to hold through it without a special case.
+GITPROMOTE = [
+    ("git worktree list", True),
+    ("git worktree list --porcelain", True),
+    ("git -C /srv/x worktree list", True),
+    ("git merge-base main feature", True),
+    ("git merge-base --is-ancestor a b", True),
+    ("git -C /srv/x merge-base a b", True),
+    ("git worktree list | wc -l", True),
+    ("git worktree", False),
+    ("git worktree add ../wt topic", False),
+    ("git worktree remove ../wt", False),
+    ("git worktree prune", False),
+    ("git worktree lock ../wt", False),
+    ("git worktree move ../wt ../wt2", False),
+    ("git worktree repair", False),
+]
+promote_fail = 0
+for _cmd, _want in GITPROMOTE:
+    if is_read_only(_cmd) != _want:
+        print("FAIL (git promote, want %s): %r" % (_want, _cmd))
+        promote_fail += 1
+print("git promote: %d/%d passed" % (len(GITPROMOTE) - promote_fail,
+                                     len(GITPROMOTE)))
+
+# --- appended: names the parser can settle on its own. The list was already
+# --- there as the one the classifier never sees; saying so in the verdict is
+# --- what takes `python3` out of the "unknown command" pile it never belonged
+# --- in. Dispatchers stay unknown -- `docker` names a subject, not an act.
+import readonly_cmd as rc
+
+KNOWN_EXEC = [
+    ("python3 -c 'print(1)'", "known write/exec command", "python3"),
+    ("mkdir -p a/b", "known write/exec command", "mkdir"),
+    ("rm -rf /tmp/x", "known write/exec command", "rm"),
+    ("node script.js", "known write/exec command", "node"),
+    ("ls | xargs rm", "known write/exec command", "xargs"),
+    ("mkfs.ext4 /dev/sda", "known write/exec command", "mkfs.ext4"),
+    ("docker ps", rc.UNKNOWN_COMMAND_RULE, "docker"),
+    ("glab mr list", rc.UNKNOWN_COMMAND_RULE, "glab"),
+]
+known_fail = 0
+for _cmd, _rule, _detail in KNOWN_EXEC:
+    _v = rc.explain(_cmd)
+    if not _v or _v["rule"] != _rule or _v["detail"] != _detail:
+        print("FAIL (known exec, want %r/%r): %r -> %r"
+              % (_rule, _detail, _cmd, _v))
+        known_fail += 1
+print("known exec: %d/%d passed" % (len(KNOWN_EXEC) - known_fail,
+                                    len(KNOWN_EXEC)))
+
+# --- appended: `cd` before `git` is no longer refused outright. The target
+# --- repository is inspected instead -- local config, git verb, and the one
+# --- hook a read verb can fire -- and anything that cannot be inspected is
+# --- refused. The fixtures below are real repositories because that is what
+# --- the check reads; a stub would test the stub.
+import shutil as _shutil
+import subprocess as _subprocess
+import tempfile as _tempfile
+
+cdgit_checks = []
+
+
+def cdgit_check(name, ok):
+    cdgit_checks.append((name, bool(ok)))
+
+
+def _mkrepo(parent, name, config=(), hooks=()):
+    """A real git repo, optionally polluted with config keys or hooks."""
+    path = os.path.join(parent, name)
+    os.makedirs(path)
+    _subprocess.run(["git", "init", "-q", path], stdout=_subprocess.DEVNULL,
+                    stderr=_subprocess.DEVNULL)
+    for key, value in config:
+        _subprocess.run(["git", "-C", path, "config", "--local", key, value],
+                        stdout=_subprocess.DEVNULL, stderr=_subprocess.DEVNULL)
+    for hook, mode in hooks:
+        hook_path = os.path.join(path, ".git", "hooks", hook)
+        with open(hook_path, "w", encoding="utf-8") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(hook_path, mode)
+    return path
+
+
+def rule_of(command, cwd=None):
+    verdict = rc.explain(command, cwd=cwd)
+    return verdict and verdict["rule"]
+
+
+_cdgit_tmp = _tempfile.mkdtemp(prefix="autoallow-cdgit-")
+try:
+    clean = _mkrepo(_cdgit_tmp, "clean")
+    # Third-party keys land in sections git itself never reads, so they are not
+    # a reason to refuse. Refusing them was the first draft, and it allowed 0.
+    third = _mkrepo(_cdgit_tmp, "third-party", config=(
+        ("vscode.x", "1"),
+        ("branch.main.vscode-merge-base", "origin/main"),
+        ("lfs.repositoryformatversion", "0"),
+        ("remote.origin.glab-resolved-head", "main"),
+    ))
+    aliased = _mkrepo(_cdgit_tmp, "aliased", config=(("alias.co", "!sh"),))
+    hookspath = _mkrepo(_cdgit_tmp, "hookspath",
+                        config=(("core.hooksPath", "/tmp/evil"),))
+    indexhook = _mkrepo(_cdgit_tmp, "index-hook",
+                        hooks=(("post-index-change", 0o755),))
+    inerthook = _mkrepo(_cdgit_tmp, "inert-hook",
+                        hooks=(("post-index-change", 0o644),))
+    otherhook = _mkrepo(_cdgit_tmp, "other-hook",
+                        hooks=(("pre-commit", 0o755), ("post-checkout", 0o755)))
+    plain = os.path.join(_cdgit_tmp, "not-a-repo")
+    os.makedirs(plain)
+    missing = os.path.join(_cdgit_tmp, "gone")
+
+    cdgit_check("a clean repo is auto-allowed",
+                is_read_only("cd %s && git status" % clean))
+    cdgit_check("the rest of the line is still checked",
+                is_read_only("cd %s && git log --oneline | head -20" % clean))
+    cdgit_check("pushd counts the same as cd",
+                is_read_only("pushd %s && git show HEAD" % clean))
+    cdgit_check("git worktree list passes the inspection",
+                is_read_only("cd %s && git worktree list" % clean))
+    cdgit_check("third-party keys are in sections git does not read",
+                is_read_only("cd %s && git status" % third))
+    cdgit_check("a hook a read verb cannot fire is not a reason to refuse",
+                is_read_only("cd %s && git status" % otherhook))
+    cdgit_check("a post-index-change that is not executable is inert",
+                is_read_only("cd %s && git status" % inerthook))
+
+    cdgit_check("a missing target cannot be inspected",
+                rule_of("cd %s && git log" % missing)
+                == "cd before git: target repo unreadable")
+    cdgit_check("a directory that is not a repo cannot be inspected",
+                rule_of("cd %s && git log" % plain)
+                == "cd before git: target repo unreadable")
+    cdgit_check("an alias to a shell is not harmless",
+                rule_of("cd %s && git status" % aliased)
+                == "cd before git: config key is not harmless")
+    cdgit_check("core.hooksPath points somewhere unchecked",
+                rule_of("cd %s && git status" % hookspath)
+                == "cd before git: config key is not harmless")
+    cdgit_check("an executable post-index-change is the hook status fires",
+                rule_of("cd %s && git status" % indexhook)
+                == "cd before git: executable post-index-change hook")
+    cdgit_check("ls-remote reads the remote configuration",
+                rule_of("cd %s && git ls-remote" % clean)
+                == "cd before git: network-touching git verb")
+    cdgit_check("git remote reads the remote configuration",
+                rule_of("cd %s && git remote -v" % clean)
+                == "cd before git: network-touching git verb")
+    cdgit_check("a variable target names no repo to inspect",
+                rule_of("cd $DIR && git log") ==
+                "cd before git: cd target not identifiable")
+    cdgit_check("a bare cd goes home, which this parser cannot name",
+                rule_of("cd && git status")
+                == "cd before git: cd target not identifiable")
+    cdgit_check("a glob target names no single repo",
+                rule_of("cd repo* && git status", cwd=_cdgit_tmp)
+                == "cd before git: cd target not identifiable")
+    cdgit_check("a relative target resolves against cwd",
+                rc.explain("cd clean && git status", cwd=_cdgit_tmp) is None)
+    cdgit_check("a relative target without cwd is not identifiable",
+                rule_of("cd clean && git status")
+                == "cd before git: cd target not identifiable")
+    cdgit_check("two directory changes are still refused",
+                rule_of("cd %s && cd %s && git log" % (clean, third))
+                == "multiple directory changes in one command")
+
+    # Linked worktrees are where this hook's friction actually lives, and the
+    # worktree config scope errors out on two conditions that are not failures:
+    # the extension being off, and the file not existing yet. Reading either as
+    # "unreadable" refuses every sibling worktree, which is the whole gain.
+    _subprocess.run(["git", "-C", clean, "-c", "user.email=t@t", "-c",
+                     "user.name=t", "commit", "-q", "--allow-empty", "-m", "x"],
+                    stdout=_subprocess.DEVNULL, stderr=_subprocess.DEVNULL)
+    linked = os.path.join(_cdgit_tmp, "linked")
+    _subprocess.run(["git", "-C", clean, "worktree", "add", "-q", linked,
+                     "-b", "wt"],
+                    stdout=_subprocess.DEVNULL, stderr=_subprocess.DEVNULL)
+    cdgit_check("a linked worktree is inspectable",
+                is_read_only("cd %s && git status" % linked))
+    _subprocess.run(["git", "-C", clean, "config", "extensions.worktreeConfig",
+                     "true"], stdout=_subprocess.DEVNULL,
+                    stderr=_subprocess.DEVNULL)
+    cdgit_check("the extension without the file yet is not a failed inspection",
+                is_read_only("cd %s && git status" % linked))
+    _subprocess.run(["git", "-C", linked, "config", "--worktree",
+                     "core.hooksPath", "/tmp/evil"],
+                    stdout=_subprocess.DEVNULL, stderr=_subprocess.DEVNULL)
+    cdgit_check("a worktree-scoped key is read when the extension is on",
+                rule_of("cd %s && git status" % linked)
+                == "cd before git: config key is not harmless")
+    cdgit_check("and it does not follow the main worktree",
+                is_read_only("cd %s && git status" % clean))
+finally:
+    _shutil.rmtree(_cdgit_tmp, ignore_errors=True)
+
+cdgit_fail = 0
+for _name, _ok in cdgit_checks:
+    if not _ok:
+        print("FAIL (cd/git): %s" % _name)
+        cdgit_fail += 1
+print("cd/git: %d/%d passed" % (len(cdgit_checks) - cdgit_fail,
+                                len(cdgit_checks)))
+
 # ------------------------------------------------------------------ log
 
 import io
@@ -644,8 +921,11 @@ for _name, _ok in llm_checks:
         llm_fail += 1
 print("llm: %d/%d passed" % (len(llm_checks) - llm_fail, len(llm_checks)))
 
+
 total = (len(ALLOW) + len(DENY) + len(EXTRA) + len(HARDENING) + len(GH)
+         + _tools + len(GITPROMOTE) + len(KNOWN_EXEC) + len(cdgit_checks)
          + len(log_checks) + len(llm_checks))
-total_fail = fails + extra_fail + hard_fail + gh_fail + log_fail + llm_fail
+total_fail = (fails + extra_fail + hard_fail + gh_fail + tool_fail
+              + promote_fail + known_fail + cdgit_fail + log_fail + llm_fail)
 print("TOTAL: %d/%d passed" % (total - total_fail, total))
 sys.exit(1 if total_fail else 0)

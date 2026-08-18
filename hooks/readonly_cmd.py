@@ -51,11 +51,83 @@ GIT_READ_SUBCOMMANDS = {
     "ls-files", "ls-remote", "ls-tree", "blame", "describe", "cat-file",
     "for-each-ref", "shortlog", "config", "grep", "reflog", "rev-list",
     "show-ref", "count-objects", "var", "whatchanged", "check-ignore",
+    "worktree", "merge-base",
 }
 GIT_FLAGS_WITH_VALUE = {"-C", "--git-dir", "--work-tree", "--namespace"}
 GIT_BRANCH_MUTATE = {"-d", "-D", "-m", "-M", "-c", "-C", "-f", "--delete",
                      "--move", "--copy", "--force", "--unset-upstream",
                      "--edit-description"}
+
+# Verbs that read the remote configuration, which is where a `remote.<n>.url`
+# of `ext::sh -c ...` turns into an execution. Everything else in the read set
+# above never looks at it, and that is what lets the `cd` inspection below skip
+# the `remote` section entirely. Most of these are already refused as write
+# subcommands; the two that matter here are `ls-remote` and `remote`.
+GIT_NETWORK_SUBCOMMANDS = {"fetch", "pull", "push", "clone", "ls-remote",
+                           "remote", "submodule", "archive"}
+
+# Sections git itself reads a value out of. Outside them the key is inert
+# whatever it says -- third-party tools park their own keys in a repo's local
+# config (`branch.<n>.vscode-merge-base`, `remote.origin.glab-resolved-head`,
+# `lfs.*`) and treating an unknown key as a dangerous one refuses every real
+# repository. See docs/adr/0002.
+GIT_CONFIG_SECTIONS_READ = {
+    "core", "alias", "include", "includeif", "diff", "difftool", "merge",
+    "mergetool", "filter", "credential", "http", "ssh", "url", "uploadpack",
+    "receivepack", "protocol", "gpg", "sendemail", "pager", "man", "help",
+    "browser", "guitool", "instaweb", "sequence", "imap", "svn", "svn-remote",
+    "trace2", "safe", "fsmonitor", "web",
+}
+# Inside a watched section, only these keys are accepted. They are what `git
+# init` writes and none of them names a program or a path git will run.
+GIT_CONFIG_KEYS_OK = {
+    "core.repositoryformatversion", "core.filemode", "core.bare",
+    "core.logallrefupdates", "core.symlinks", "core.ignorecase",
+    "core.precomposeunicode",
+}
+GIT_CONFIG_TRUE = {"", "true", "yes", "on", "1"}
+GIT_INSPECT_TIMEOUT = 5
+
+# javap's -J passes an option through to the JVM (`-J-javaagent:evil.jar`), so
+# the flags are allowlisted. The single-dash long flags are matched whole,
+# which the walk below does before it starts splitting a word into letters.
+JAVAP_FLAGS_OK = {
+    "-c", "-p", "-s", "-l", "-v", "-verbose", "-public", "-protected",
+    "-package", "-private", "-constants", "-sysinfo",
+    "-help", "--help", "-version", "--version",
+}
+JAVAP_FLAGS_WITH_VALUE = {"--class-path", "--module-path", "--system",
+                          "--module", "--multi-release"}
+# Single-dash flags that take the next word. They are consumed before the walk
+# because the per-letter pass would read `-cp` as the bundle `-c -p` and then
+# mistake the classpath for a class name.
+JAVAP_FLAGS_TAKING_NEXT = {"-cp", "-classpath", "-bootclasspath", "-m"}
+
+# unzip's default action is to extract, so a listing flag is required rather
+# than merely permitted. `-Z` is zipinfo mode and `-c` writes to stdout;
+# neither puts anything on disk.
+UNZIP_LIST_FLAGS = {"-l", "-p", "-t", "-z", "-v", "-Z", "-c"}
+UNZIP_FLAGS_OK = UNZIP_LIST_FLAGS | {"-q", "-C", "-M"}
+UNZIP_FLAGS_WITH_VALUE = {"-x", "-P"}
+
+# curl is allowlisted in the same direction and for the same reason as `sort`:
+# the flags that write do not look like actions. -o and -O write a file, -D and
+# -c write a header/cookie file, -K reads a config file that can carry
+# `output=`, and -d/-F/-T/-X send a mutating request. An unknown flag is
+# refused rather than enumerated.
+CURL_FLAGS_OK = {
+    "-s", "--silent", "-S", "--show-error", "-L", "--location",
+    "-I", "--head", "-i", "--include", "-f", "--fail", "--fail-with-body",
+    "-k", "--insecure", "-v", "--verbose", "-g", "--globoff",
+    "-N", "--no-buffer", "-4", "-6", "--compressed", "--no-progress-meter",
+    "--http1.1", "--http2", "--help", "--version",
+}
+CURL_FLAGS_WITH_VALUE = {
+    "-H", "--header", "-m", "--max-time", "--connect-timeout",
+    "-A", "--user-agent", "-e", "--referer", "-x", "--proxy",
+    "--retry", "--retry-delay", "--retry-max-time", "--resolve",
+    "--limit-rate", "-b", "--cookie", "--url",
+}
 
 FIND_BAD = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fls",
             "-files0-from"}
@@ -195,11 +267,58 @@ ENV_FLAGS_OK = {"-", "-i", "--ignore-environment", "-0", "--null",
                 "-v", "--debug", "--help", "--version"}
 ENV_FLAGS_WITH_VALUE = {"-u", "--unset"}
 
+# Names the parser can settle without looking at a single argument. The
+# membership rule is one thing rather than a feeling about each name: the name
+# alone finishes the question. `rm` is a deletion whatever follows it, `sudo` is
+# an escalation, `sh` runs whatever it is handed.
+#
+# Dispatchers are not on the list, and that includes the system-control ones.
+# `systemctl`, `ip`, `iptables`, `sysctl` name a subject, not an act: the verb
+# is the subcommand, and `systemctl status` is exactly as much a read as
+# `docker ps`. Holding them back was worth reconsidering because the reason
+# given -- that a wrong yes on `systemctl stop` is unusually bad -- does not
+# survive comparison with `docker system prune -f` or `kubectl delete`, which
+# the classifier already judges. Either the tier is trusted with dispatchers or
+# it is not; a line drawn between two equally destructive verbs is not a line.
+# tests/eval_llm.py measures that trust on read/write pairs for each of them.
+#
+# The list decides two things at once. It is how far a wrong classifier answer
+# can travel -- these names never reach it -- and it is a verdict the parser can
+# state on its own. Those are the same fact said twice: a name that settles the
+# question needs no second opinion, and answering "I do not know this command"
+# about `python3` was never true.
+KNOWN_EXECUTORS = {
+    "rm", "rmdir", "unlink", "shred", "dd", "mkfs", "mkswap", "wipefs",
+    "fdisk", "parted", "sgdisk", "truncate", "tee", "install",
+    "mv", "cp", "ln", "chmod", "chown", "chgrp", "touch", "mkdir",
+    "kill", "pkill", "killall", "reboot", "shutdown", "halt", "poweroff",
+    "mount", "umount", "swapoff", "swapon",
+    "useradd", "userdel", "usermod", "groupadd", "passwd", "chpasswd",
+    "visudo", "sudo", "su", "doas", "pkexec", "setcap", "setfacl",
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "eval", "exec", "source",
+    "python", "python3", "perl", "ruby", "node", "php", "xargs",
+    "crontab", "at", "modprobe", "insmod", "rmmod",
+}
+
+# mkfs and fsck ship one binary per filesystem -- mkfs.ext4, fsck.xfs -- so the
+# names above only cover the dispatchers.
+KNOWN_EXECUTOR_PREFIXES = ("mkfs.", "fsck.", "mount.", "umount.")
+
 SUBST_PLACEHOLDER = "\x00SUBST\x00"
 
 # Command names accepted while validating the current line, for the
 # cross-command checks in check_whole_line(). Reset by is_read_only().
 SEEN_COMMANDS = []
+
+# The one `cd` target of the current line, or None when the parser cannot name
+# it (no operand, `cd -`, a variable, a glob). None is not "no target" -- it is
+# "this line moves somewhere I cannot inspect", which check_whole_line() has to
+# refuse rather than skip. Reset alongside SEEN_COMMANDS.
+SEEN_CD_TARGETS = []
+
+# git subcommands seen on the current line, so check_whole_line() can tell a
+# verb that reads the remote configuration from one that does not.
+SEEN_GIT_SUBCOMMANDS = []
 
 
 class Deny(Exception):
@@ -502,7 +621,8 @@ def check_find(args):
             raise Deny("find %s", a)
 
 
-def walk_flags(args, exact_ok, with_value, cmd, value_hook=None):
+def walk_flags(args, exact_ok, with_value, cmd, value_hook=None,
+               scan_all=False):
     """Return the operands, refusing any flag that is not on the allowlist.
 
     Short flags bundle (`sort -rn`) and carry their value attached (`awk -F:`),
@@ -512,14 +632,28 @@ def walk_flags(args, exact_ok, with_value, cmd, value_hook=None):
 
     `value_hook` maps a flag to a function that inspects its value, for the ones
     that carry something worth reading -- awk's `-e` takes a program.
+
+    `scan_all` keeps walking past the operands instead of handing them back at
+    the first one. Some tools go on taking flags after their operand and mean
+    them: `curl URL -o f` writes the file, `unzip x.zip -d /tmp` extracts, and
+    `javap Foo -J...` reaches the JVM. Stopping at the first operand reads all
+    three as harmless.
     """
+    operands = []
     i = 0
     while i < len(args):
         a = args[i]
         if a == "--":
-            return args[i + 1:]
+            if not scan_all:
+                return args[i + 1:]
+            i += 1
+            continue
         if not a.startswith("-") or a == "-":
-            return args[i:]
+            if not scan_all:
+                return args[i:]
+            operands.append(a)
+            i += 1
+            continue
 
         if a.startswith("--"):
             head, sep, value = a.partition("=")
@@ -563,7 +697,7 @@ def walk_flags(args, exact_ok, with_value, cmd, value_hook=None):
                 raise Deny(cmd + " %s", flag)
             j += 1
         i += 1
-    return []
+    return operands
 
 
 def check_sort(args):
@@ -714,6 +848,66 @@ def check_file(args):
     walk_flags(args, FILE_FLAGS_OK, FILE_FLAGS_WITH_VALUE, "file")
 
 
+def check_javap(args):
+    """Disassembly is a read; the flags that reach the JVM are not.
+
+    `-cp` and friends are pulled out with their value first. Left in, the
+    per-letter walk reads `-cp` as the bundle `-c -p` and the classpath that
+    follows becomes an operand, so a flag that takes a path would look like a
+    class name.
+    """
+    rest = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in JAVAP_FLAGS_TAKING_NEXT:
+            i += 1
+            if i >= len(args):
+                raise Deny("javap %s without a value", a)
+            i += 1
+            continue
+        rest.append(a)
+        i += 1
+    walk_flags(rest, JAVAP_FLAGS_OK, JAVAP_FLAGS_WITH_VALUE, "javap",
+               scan_all=True)
+
+
+def check_unzip(args):
+    """Refuse unless a listing flag is present: extraction is the default.
+
+    Two passes for two questions. The first asks whether anything on the line
+    puts unzip into a mode that does not write, and it has to see through
+    bundles (`-lq`). The second is the ordinary flag allowlist, which is what
+    catches `-d` wherever it sits -- including after the archive name, where it
+    still picks the extraction directory.
+    """
+    listed = False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith("-") and not a.startswith("--") and a != "-":
+            j = 1
+            while j < len(a):
+                flag = "-" + a[j]
+                if flag in UNZIP_FLAGS_WITH_VALUE:
+                    if not a[j + 1:]:
+                        i += 1  # its value is the next word
+                    break
+                if flag in UNZIP_LIST_FLAGS:
+                    listed = True
+                j += 1
+        i += 1
+    if not listed:
+        raise Deny("unzip without a list flag extracts")
+    walk_flags(args, UNZIP_FLAGS_OK, UNZIP_FLAGS_WITH_VALUE, "unzip",
+               scan_all=True)
+
+
+def check_curl(args):
+    walk_flags(args, CURL_FLAGS_OK, CURL_FLAGS_WITH_VALUE, "curl",
+               scan_all=True)
+
+
 def check_jq(args):
     for a in args:
         if a in JQ_BAD_FLAGS:
@@ -792,6 +986,26 @@ def check_gh(args):
         raise Deny("gh %s %s", sub, action)
 
 
+def cd_target(args):
+    """The one directory a `cd` moves to, or None when it cannot be named.
+
+    None covers `cd` with no operand (home), `cd -` (the previous directory),
+    a variable, and a glob. All four leave the destination outside what this
+    parser can read, which is a different thing from there being no
+    destination -- see check_whole_line().
+    """
+    words = [a for a in args if not a.startswith("-")]
+    if len(words) != 1:
+        return None
+    word = words[0]
+    if has_unquoted_glob(word):
+        return None
+    target = unquote(word)
+    if SUBST_PLACEHOLDER in target or "$" in target:
+        return None
+    return target
+
+
 def check_uniq(args):
     operands = []
     skip_next = False
@@ -835,6 +1049,9 @@ def check_git(args):
         return  # bare `git` prints usage
     sub = args[idx]
     rest = args[idx + 1:]
+    # Recorded before the membership test so check_whole_line() sees the verb of
+    # every git on the line, `-C <path>` forms included.
+    SEEN_GIT_SUBCOMMANDS.append(unquote(sub))
     if sub not in GIT_READ_SUBCOMMANDS:
         raise Deny("git %s", sub)
 
@@ -856,6 +1073,12 @@ def check_git(args):
         action = next((r for r in rest if not r.startswith("-")), None)
         if action is not None and action != "show":
             raise Deny("git reflog %s", action)
+    elif sub == "worktree":
+        # `list` only. Every other action on this subcommand -- and the bare
+        # form, which prints usage -- creates, moves or deletes a working tree.
+        action = next((r for r in rest if not r.startswith("-")), None)
+        if action != "list":
+            raise Deny("git worktree %s", action)
 
 
 CHECKERS = {
@@ -875,6 +1098,9 @@ CHECKERS = {
     "rg": check_rg,
     "file": check_file,
     "gh": check_gh,
+    "javap": check_javap,
+    "unzip": check_unzip,
+    "curl": check_curl,
 }
 
 
@@ -960,9 +1186,13 @@ def validate_command(words, depth=0):
         return
 
     if cmd in ALWAYS_OK:
+        if cmd in ("cd", "pushd"):
+            SEEN_CD_TARGETS.append(cd_target(args))
         SEEN_COMMANDS.append(cmd)
         return
 
+    if cmd in KNOWN_EXECUTORS or cmd.startswith(KNOWN_EXECUTOR_PREFIXES):
+        raise Deny("known write/exec command: %r", cmd)
     raise Deny("command not on read-only allowlist: %r", cmd)
 
 
@@ -986,26 +1216,122 @@ def validate_line(command, depth=0):
         validate_command(segment)
 
 
-def check_whole_line():
+def inspect_repo(target):
+    """Refuse unless the repository at `target` is inert for a read-only verb.
+
+    Two things are read: the configuration git will consult, and the one hook a
+    read-only verb can fire. The unit of the configuration check is the section
+    rather than the key, because git only reads its own namespace -- a repo's
+    local config always carries keys some other tool wrote (`lfs.*`,
+    `branch.<n>.vscode-merge-base`), and treating an unknown key as a dangerous
+    one refuses every real repository. See docs/adr/0002.
+
+    Fail closed throughout. A directory that is gone, a path that is not a
+    repository, a git that times out: each means the inspection did not happen,
+    and an inspection that did not happen is not a clean bill of health.
+    """
+    import os
+    import subprocess
+
+    def git(*argv):
+        try:
+            proc = subprocess.run(("git", "-C", target) + argv,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL,
+                                  timeout=GIT_INSPECT_TIMEOUT)
+        except Exception:
+            proc = None
+        if proc is None or proc.returncode != 0:
+            raise Deny("cd before git: target repo unreadable: %r", target)
+        return proc.stdout.decode("utf-8", "replace").splitlines()
+
+    if not os.path.isdir(target):
+        raise Deny("cd before git: target repo unreadable: %r", target)
+
+    entries = git("config", "--local", "--list")
+
+    dirs = git("rev-parse", "--absolute-git-dir", "--git-common-dir")
+    if len(dirs) < 2:
+        raise Deny("cd before git: target repo unreadable: %r", target)
+    git_dir, common_dir = dirs[0], dirs[1]
+    if not os.path.isabs(common_dir):
+        common_dir = os.path.join(target, common_dir)
+
+    # The worktree-scoped file is read only when the repository turns the
+    # extension on, and `git config --worktree --list` is a fatal error on both
+    # counts it is not: without the extension in a linked worktree, and with
+    # the extension when the file does not exist yet. Neither is an inspection
+    # that failed -- there is nothing at that scope to inspect -- so the two
+    # preconditions are checked here rather than read out of an exit code that
+    # cannot tell them apart from a repository we genuinely cannot read.
+    if any(entry.partition("=")[0].strip().lower() == "extensions.worktreeconfig"
+           and entry.partition("=")[2].strip().lower() in GIT_CONFIG_TRUE
+           for entry in entries) and os.path.isfile(
+               os.path.join(git_dir, "config.worktree")):
+        entries = entries + git("config", "--worktree", "--list")
+
+    for entry in entries:
+        key = entry.split("=", 1)[0].strip().lower()
+        if not key:
+            continue
+        if key.split(".", 1)[0] not in GIT_CONFIG_SECTIONS_READ:
+            continue  # git never reads the value, so it cannot run it
+        if key not in GIT_CONFIG_KEYS_OK:
+            raise Deny("cd before git: config key %r is not harmless", key)
+
+    # The only hook a read-only verb was measured to fire: `git status`
+    # refreshes the stat cache and writes the index. Refusing every executable
+    # hook was the earlier draft and it disqualified every git-lfs repository
+    # while closing nothing a read verb could reach. See docs/adr/0002.
+    hook = os.path.join(common_dir, "hooks", "post-index-change")
+    if os.path.isfile(hook) and os.access(hook, os.X_OK):
+        raise Deny("cd before git: executable post-index-change hook")
+
+
+def check_whole_line(cwd=None):
     """Cross-command rules that only make sense once the line is fully parsed.
 
-    Both mirror checks Claude Code itself applies: `cd` followed by `git` can
-    run hooks/fsmonitor from the target directory, and more than one `cd` in a
-    line makes the effective working directory hard to reason about.
+    More than one `cd` makes the effective working directory hard to reason
+    about, and that stays a refusal outright. `cd` before `git` was one too,
+    and it was the second largest bucket in the log while every sampled line
+    was a read. The threat behind it is real -- git runs hooks and reads
+    configuration from wherever it lands -- so it is now confirmed instead of
+    assumed: the verb must be one that never reads the remote configuration,
+    the target must be nameable, and the repository there must inspect clean.
     """
     cds = SEEN_COMMANDS.count("cd") + SEEN_COMMANDS.count("pushd")
     if cds > 1:
         raise Deny("multiple directory changes in one command")
-    if cds and "git" in SEEN_COMMANDS:
-        raise Deny("cd before git can execute hooks from the target directory")
+    if not (cds and "git" in SEEN_COMMANDS):
+        return
+
+    for sub in SEEN_GIT_SUBCOMMANDS:
+        if sub in GIT_NETWORK_SUBCOMMANDS:
+            raise Deny("cd before git: network-touching git verb %r", sub)
+
+    if len(SEEN_CD_TARGETS) != 1 or SEEN_CD_TARGETS[0] is None:
+        raise Deny("cd before git: cd target not identifiable")
+
+    import os
+
+    target = os.path.expanduser(SEEN_CD_TARGETS[0])
+    if not os.path.isabs(target):
+        if not (isinstance(cwd, str) and cwd):
+            raise Deny("cd before git: cd target not identifiable")
+        target = os.path.join(cwd, target)
+    inspect_repo(target)
 
 
-def explain(command, extra_allowed=None):
+def explain(command, extra_allowed=None, cwd=None):
     """None when the whole line is read-only, otherwise why it was rejected.
 
     `extra_allowed` adds one command name to the allowlist for this call only.
     It exists so a name the LLM classifier vouched for can be re-checked against
     every other rule rather than bypassing them.
+
+    `cwd` is where the command would run, and only the `cd` before `git` check
+    reads it: a relative target has no meaning without it, and a target with no
+    meaning is refused.
 
     The reason is what makes the denial log worth keeping: it turns "this
     prompted" into "this prompted because `sed -i` writes in place", which is
@@ -1015,12 +1341,14 @@ def explain(command, extra_allowed=None):
         return {"rule": "empty command", "detail": None,
                 "reason": "empty command"}
     del SEEN_COMMANDS[:]
+    del SEEN_CD_TARGETS[:]
+    del SEEN_GIT_SUBCOMMANDS[:]
     added = extra_allowed and extra_allowed not in ALWAYS_OK
     if added:
         ALWAYS_OK.add(extra_allowed)
     try:
         validate_line(command)
-        check_whole_line()
+        check_whole_line(cwd)
         return None
     except Deny as exc:
         return {"rule": exc.rule or "denied", "detail": exc.detail,
@@ -1051,41 +1379,6 @@ UNKNOWN_COMMAND_RULE = "command not on read-only allowlist"
 
 LLM_ENV = "PLAN_MODE_AUTOALLOW_LLM"
 LLM_ON = {"1", "on", "yes", "true"}
-
-# Names that never reach the classifier, however it might vote. This is the list
-# that decides how far a wrong answer can travel, so the membership rule has to
-# be one thing rather than a feeling about each name.
-#
-# The rule: the name alone settles the question. `rm` is a deletion whatever
-# follows it, `sudo` is an escalation, `sh` runs whatever it is handed. Asking a
-# model about those is not a judgement call, and a yes is not a close call
-# either -- it is a wrong answer.
-#
-# Dispatchers are not on the list, and that includes the system-control ones.
-# `systemctl`, `ip`, `iptables`, `sysctl` name a subject, not an act: the verb
-# is the subcommand, and `systemctl status` is exactly as much a read as
-# `docker ps`. Holding them back was worth reconsidering because the reason
-# given -- that a wrong yes on `systemctl stop` is unusually bad -- does not
-# survive comparison with `docker system prune -f` or `kubectl delete`, which
-# the classifier already judges. Either the tier is trusted with dispatchers or
-# it is not; a line drawn between two equally destructive verbs is not a line.
-# tests/eval_llm.py measures that trust on read/write pairs for each of them.
-LLM_HARD_DENY = {
-    "rm", "rmdir", "unlink", "shred", "dd", "mkfs", "mkswap", "wipefs",
-    "fdisk", "parted", "sgdisk", "truncate", "tee", "install",
-    "mv", "cp", "ln", "chmod", "chown", "chgrp", "touch", "mkdir",
-    "kill", "pkill", "killall", "reboot", "shutdown", "halt", "poweroff",
-    "mount", "umount", "swapoff", "swapon",
-    "useradd", "userdel", "usermod", "groupadd", "passwd", "chpasswd",
-    "visudo", "sudo", "su", "doas", "pkexec", "setcap", "setfacl",
-    "sh", "bash", "zsh", "dash", "ksh", "fish", "eval", "exec", "source",
-    "python", "python3", "perl", "ruby", "node", "php", "xargs",
-    "crontab", "at", "modprobe", "insmod", "rmmod",
-}
-
-# mkfs and fsck ship one binary per filesystem -- mkfs.ext4, fsck.xfs -- so the
-# names above only cover the dispatchers.
-LLM_HARD_DENY_PREFIXES = ("mkfs.", "fsck.", "mount.", "umount.")
 
 LLM_TIMEOUT = 30
 LLM_MODEL = "haiku"
@@ -1234,14 +1527,18 @@ def llm_second_opinion(command, verdict, cwd=None):
     if not llm_enabled() or verdict["rule"] != UNKNOWN_COMMAND_RULE:
         return False
     name = verdict["detail"]
-    if not name or name in LLM_HARD_DENY:
+    # The rule gate above already excludes these -- a known executor gets its
+    # own verdict now -- so this is a second lock on the same door. It stays
+    # because the cost of it being redundant is nothing and the cost of the
+    # gate ever loosening is a model vote on `rm`.
+    if not name or name in KNOWN_EXECUTORS:
         return False
-    if name.startswith(LLM_HARD_DENY_PREFIXES):
+    if name.startswith(KNOWN_EXECUTOR_PREFIXES):
         return False
     cached = cached_allow(command)
     if not cached and not llm_says_read_only(command):
         return False
-    if explain(command, extra_allowed=name) is not None:
+    if explain(command, extra_allowed=name, cwd=cwd) is not None:
         return False
     if not cached:
         record_allow(command, name, cwd)
@@ -1435,7 +1732,7 @@ def main():
     command = (payload.get("tool_input") or {}).get("command")
     if not isinstance(command, str):
         return
-    verdict = explain(command)
+    verdict = explain(command, cwd=payload.get("cwd"))
     reason = "plan mode: read-only command"
     if verdict is not None:
         # Nothing above this line costs a network round trip, and the classifier
