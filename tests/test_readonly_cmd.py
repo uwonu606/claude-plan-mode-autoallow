@@ -647,7 +647,7 @@ for _name, _ok in cdgit_checks:
 print("cd/git: %d/%d passed" % (len(cdgit_checks) - cdgit_fail,
                                 len(cdgit_checks)))
 
-# ------------------------------------------------------------------ log
+# ------------------------------------------------------------- judgment log
 
 import io
 import json as _json
@@ -684,6 +684,24 @@ def read_log(path):
     return rows
 
 
+def count_lines(path):
+    if not os.path.exists(path):
+        return 0
+    with open(path, encoding="utf-8") as fh:
+        return sum(1 for _ in fh)
+
+
+def capture(fn, *args):
+    """Run a reporter and hand back (return code, what it printed)."""
+    stdout = sys.stdout
+    sys.stdout = io.StringIO()
+    try:
+        code = fn(*args)
+        return code, sys.stdout.getvalue()
+    finally:
+        sys.stdout = stdout
+
+
 log_checks = []
 
 
@@ -695,46 +713,88 @@ _saved_env = os.environ.get("PLAN_MODE_AUTOALLOW_LOG")
 _saved_dir = os.environ.get("CLAUDE_CONFIG_DIR")
 _tmp = tempfile.mkdtemp(prefix="autoallow-log-")
 try:
-    logfile = os.path.join(_tmp, "denied.jsonl")
+    logfile = os.path.join(_tmp, "judgments.jsonl")
+    bodies = os.path.join(_tmp, "bodies")
     os.environ["PLAN_MODE_AUTOALLOW_LOG"] = logfile
 
     out = run_main("rm -rf /tmp/x", cwd="/srv/project")
     rows = read_log(logfile)
-    log_check("denial is logged", len(rows) == 1)
-    log_check("denial logs the command",
-              rows and rows[0].get("command") == "rm -rf /tmp/x")
-    log_check("denial logs a reason", rows and rows[0].get("reason"))
-    log_check("denial logs a rule", rows and rows[0].get("rule"))
-    log_check("denial logs the detail separately",
-              rows and rows[0].get("detail") == "rm")
-    log_check("rule holds no variable part",
-              rows and "rm" not in rows[0].get("rule", "rm"))
-    log_check("denial logs cwd", rows and rows[0].get("cwd") == "/srv/project")
-    log_check("denial prints no decision", out == "")
-    log_check("log file is not world-readable",
+    row = rows[0] if rows else {}
+    log_check("the judgment is recorded", len(rows) == 1)
+    log_check("the line is the seven fields and nothing else",
+              list(row) == ["ts", "rule", "detail", "cwd", "head", "ref",
+                            "bytes"])
+    log_check("the rule is the one the parser fired",
+              row.get("rule") == "known write/exec command"
+              and row.get("detail") == "rm")
+    log_check("no reason field: rule and detail rebuild the sentence",
+              "reason" not in row)
+    log_check("the command line does not sit in the judgment",
+              "command" not in row)
+    log_check("head is the first line of the body, for tail(1)",
+              row.get("head") == "rm -rf /tmp/x")
+    log_check("bytes measures the body", row.get("bytes") == 13)
+    body = os.path.join(bodies, row.get("ref") or "missing")
+    log_check("the body holds the command line",
+              os.path.exists(body)
+              and open(body, encoding="utf-8").read() == "rm -rf /tmp/x")
+    log_check("judgment logs cwd", row.get("cwd") == "/srv/project")
+    log_check("judgment prints no decision", out == "")
+    log_check("the judgment file is not world-readable",
               (os.stat(logfile).st_mode & 0o077) == 0)
+    log_check("the bodies directory is not world-readable",
+              (os.stat(bodies).st_mode & 0o077) == 0)
+    log_check("a body is not world-readable",
+              (os.stat(body).st_mode & 0o077) == 0)
 
     out = run_main("ls -la")
     log_check("allowed command prints allow", '"allow"' in out)
-    log_check("allowed command is not logged", len(read_log(logfile)) == 1)
+    log_check("allowed command is not recorded", len(read_log(logfile)) == 1)
 
     os.environ["PLAN_MODE_AUTOALLOW_LOG"] = "off"
     run_main("rm -rf /tmp/y")
     log_check("logging honours off switch", len(read_log(logfile)) == 1)
-    log_check("off switch reported by log_path", readonly_cmd.log_path() is None)
-
-    # Rotation keeps the recent entries and moves the old file aside.
+    log_check("off switch reported by log_path",
+              readonly_cmd.log_path() is None)
     os.environ["PLAN_MODE_AUTOALLOW_LOG"] = logfile
-    with open(logfile, "w", encoding="utf-8") as fh:
-        fh.write("x" * (readonly_cmd.LOG_MAX_BYTES + 1))
+
+    # The judgments file is a regression suite now, and rotating one deletes
+    # test cases two cycles later. Only the bodies have a ceiling.
+    with open(logfile, "a", encoding="utf-8") as fh:
+        fh.write("x" * (2 * 1024 * 1024 + 1) + "\n")
+    _before = count_lines(logfile)
     run_main("sed -i s/a/b/ f")
-    log_check("oversized log rotates", os.path.exists(logfile + ".1"))
-    log_check("rotated log restarts", len(read_log(logfile)) == 1)
+    log_check("an oversized judgment file does not rotate",
+              not os.path.exists(logfile + ".1"))
+    log_check("an oversized judgment file still appends",
+              count_lines(logfile) == _before + 1)
+
+    # Bodies are collected oldest first, in their own directory so this cannot
+    # take the ones the checks above depend on.
+    _gc_log = os.path.join(_tmp, "gc", "judgments.jsonl")
+    os.environ["PLAN_MODE_AUTOALLOW_LOG"] = _gc_log
+    _saved_max = readonly_cmd.BODIES_MAX_BYTES
+    readonly_cmd.BODIES_MAX_BYTES = 200
+    try:
+        for _i in range(12):
+            run_main("sed -i s/a%02d/b/ %s" % (_i, "f" * 40))
+        _gc_bodies = os.path.join(_tmp, "gc", "bodies")
+        _total = sum(os.path.getsize(os.path.join(_gc_bodies, n))
+                     for n in os.listdir(_gc_bodies))
+        log_check("bodies stay under the ceiling",
+                  _total <= readonly_cmd.BODIES_MAX_BYTES)
+        log_check("collecting bodies keeps every judgment",
+                  count_lines(_gc_log) == 12)
+    finally:
+        readonly_cmd.BODIES_MAX_BYTES = _saved_max
+        os.environ["PLAN_MODE_AUTOALLOW_LOG"] = logfile
 
     # A log that cannot be written must not change the decision or raise.
     os.environ["PLAN_MODE_AUTOALLOW_LOG"] = os.path.join(_tmp, "nope", "d.jsonl")
-    log_check("unwritable log stays silent on deny", run_main("rm -rf /tmp/z") == "")
+    log_check("unwritable log stays silent on deny",
+              run_main("rm -rf /tmp/z") == "")
     log_check("unwritable log still allows", '"allow"' in run_main("ls"))
+    os.environ["PLAN_MODE_AUTOALLOW_LOG"] = logfile
 
     # explain() is what makes the log triageable.
     log_check("explain returns None when allowed",
@@ -756,41 +816,137 @@ try:
     log_check("multi-argument rule keeps both values",
               readonly_cmd.explain("gh pr merge 1")["detail"] == "pr merge")
 
-    # --report must survive a malformed line and must include the rotated file.
-    os.environ["PLAN_MODE_AUTOALLOW_LOG"] = logfile
-    with open(logfile, "a", encoding="utf-8") as fh:
-        fh.write("not json\n")
-    with open(logfile + ".1", "w", encoding="utf-8") as fh:
+    # replay is the one primitive: every reporter below is a caller of it.
+    _records = readonly_cmd.load_judgments(logfile)
+    _verdicts = readonly_cmd.replay(_records)
+    log_check("replay answers once per record, in order",
+              len(_verdicts) == len(_records))
+    log_check("load_judgments fills the body back in",
+              all(r.get("command") for r in _records))
+    log_check("replay re-judges instead of reading the stored rule",
+              _verdicts[0] and _verdicts[0]["rule"] == "known write/exec command")
+    os.remove(os.path.join(bodies, _records[0]["ref"]))
+    _gone = readonly_cmd.load_judgments(logfile)
+    log_check("a collected body leaves its judgment behind",
+              "command" not in _gone[0])
+    log_check("replay says the body is gone rather than guessing",
+              readonly_cmd.replay(_gone)[0]["rule"] == "body unavailable")
+
+    # --open is the read list: admissions only, never a proven write.
+    _open_log = os.path.join(_tmp, "open", "judgments.jsonl")
+    os.environ["PLAN_MODE_AUTOALLOW_LOG"] = _open_log
+    run_main("docker ps")
+    run_main("echo x > f")
+    _code, _text = capture(readonly_cmd.open_report)
+    log_check("--open succeeds", _code == 0)
+    log_check("--open keeps what the parser did not recognise",
+              "docker" in _text)
+    log_check("--open drops what the parser proved writes",
+              "echo x" not in _text and "output redirection" not in _text)
+
+    # --regress compares the stored judgment with today's, both directions.
+    _reg_log = os.path.join(_tmp, "regress", "judgments.jsonl")
+    os.environ["PLAN_MODE_AUTOALLOW_LOG"] = _reg_log
+    readonly_cmd.record_judgment("strings f", readonly_cmd.UNKNOWN_COMMAND_RULE,
+                                 "strings")
+    readonly_cmd.record_judgment("rm -rf /x", readonly_cmd.CLASSIFIER_ALLOW_RULE,
+                                 "rm")
+    _code, _text = capture(readonly_cmd.regress)
+    log_check("--regress succeeds", _code == 0)
+    log_check("--regress reports a refusal that now passes", "strings f" in _text)
+    log_check("--regress reports a pass that is now refused", "rm -rf /x" in _text)
+
+    # A collected body is not a change of mind. Counted as one, it fills the
+    # list that exists to be read line by line.
+    _stale_log = os.path.join(_tmp, "stale", "judgments.jsonl")
+    os.environ["PLAN_MODE_AUTOALLOW_LOG"] = _stale_log
+    readonly_cmd.record_judgment("docker ps", readonly_cmd.CLASSIFIER_ALLOW_RULE,
+                                 "docker")
+    os.remove(os.path.join(_tmp, "stale", "bodies",
+                           read_log(_stale_log)[0]["ref"]))
+    _code, _text = capture(readonly_cmd.regress)
+    log_check("--regress sets a collected body aside rather than calling it a flip",
+              "auto-allowed -> refused: 0" in _text
+              and "1 skipped (body collected)" in _text)
+    os.environ["PLAN_MODE_AUTOALLOW_LOG"] = _reg_log
+
+    # --report counts replay verdicts and names the promotion candidates.
+    _code, _text = capture(readonly_cmd.report)
+    log_check("--report succeeds", _code == 0)
+    log_check("--report counts what replay decided",
+              "judgments" in _text and "auto-allowed" in _text)
+    log_check("--report names the classifier verdicts still unexpressed",
+              "rm" in _text)
+
+    # --migrate is replay with a destination: what the parser now settles by
+    # itself is not carried over, in either direction.
+    _mig = os.path.join(_tmp, "migrate")
+    os.makedirs(_mig)
+    os.environ["PLAN_MODE_AUTOALLOW_LOG"] = os.path.join(_mig,
+                                                         "judgments.jsonl")
+    with open(os.path.join(_mig, "denied.jsonl"), "w", encoding="utf-8") as fh:
         fh.write(_json.dumps({"ts": "2026-01-01T00:00:00+0900",
-                              "rule": "older rule", "detail": "x",
-                              "reason": "older rule x",
-                              "command": "old cmd"}) + "\n")
-    log_check("load_log reads the rotated file too",
-              len(readonly_cmd.load_log(logfile)) > len(read_log(logfile)))
-    log_check("rotated entries come first",
-              readonly_cmd.load_log(logfile)[0].get("rule") == "older rule")
-    stdout = sys.stdout
-    sys.stdout = io.StringIO()
-    try:
-        rc = readonly_cmd.report()
-        text = sys.stdout.getvalue()
-    finally:
-        sys.stdout = stdout
-    log_check("report succeeds", rc == 0)
-    log_check("report groups by rule", "denials" in text and "rules" in text)
+                              "rule": "command not on read-only allowlist",
+                              "detail": "docker",
+                              "reason": "command not on read-only allowlist",
+                              "command": "docker ps"}) + "\n")
+        fh.write(_json.dumps({"ts": "2026-01-01T00:00:01+0900",
+                              "rule": "command not on read-only allowlist",
+                              "detail": "strings",
+                              "reason": "command not on read-only allowlist",
+                              "command": "strings f"}) + "\n")
+        fh.write(_json.dumps({"ts": "2026-01-01T00:00:02+0900",
+                              "rule": "output redirection to",
+                              "detail": "f"}) + "\n")
+        fh.write("not json\n")
+    with open(os.path.join(_mig, "allowed.jsonl"), "w", encoding="utf-8") as fh:
+        fh.write(_json.dumps({"ts": "2026-01-02T00:00:00+0900",
+                              "name": "docker",
+                              "command": "docker images"}) + "\n")
+        fh.write(_json.dumps({"ts": "2026-01-02T00:00:01+0900",
+                              "name": "strings",
+                              "command": "strings g"}) + "\n")
+    _code, _text = capture(readonly_cmd.migrate)
+    _rows = read_log(os.path.join(_mig, "judgments.jsonl"))
+    _heads = [r.get("head") for r in _rows]
+    log_check("--migrate succeeds", _code == 0)
+    log_check("migrate carries a denial that still stands",
+              "docker ps" in _heads)
+    log_check("migrate drops a denial the parser now allows",
+              "strings f" not in _heads)
+    log_check("migrate keeps a classifier verdict the parser still needs",
+              any(r.get("rule") == readonly_cmd.CLASSIFIER_ALLOW_RULE
+                  and r.get("head") == "docker images" for r in _rows))
+    log_check("migrate drops a classifier verdict the parser absorbed",
+              "strings g" not in _heads)
+    log_check("migrate counts a bodyless legacy line apart from the drops",
+              "skipped: 1 legacy lines carried no command" in _text)
+    log_check("migrate keeps the original timestamp",
+              [r for r in _rows if r.get("head") == "docker ps"][0]["ts"]
+              == "2026-01-01T00:00:00+0900")
+    log_check("migrate re-judges rather than copying the stored rule",
+              [r for r in _rows if r.get("head") == "docker ps"][0]["rule"]
+              == readonly_cmd.UNKNOWN_COMMAND_RULE)
+    log_check("migrate sets the originals aside",
+              os.path.exists(os.path.join(_mig, "denied.jsonl.0"))
+              and os.path.exists(os.path.join(_mig, "allowed.jsonl.0")))
+    capture(readonly_cmd.migrate)
+    log_check("a second migrate has nothing left to move",
+              len(read_log(os.path.join(_mig, "judgments.jsonl")))
+              == len(_rows))
 
     # Default location: its own directory, not loose in the config root.
     os.environ.pop("PLAN_MODE_AUTOALLOW_LOG", None)
     os.environ["CLAUDE_CONFIG_DIR"] = _tmp
-    default = readonly_cmd.log_path()
     log_check("default log sits in its own directory",
-              default == os.path.join(_tmp, "plan-mode-autoallow",
-                                      "denied.jsonl"))
+              readonly_cmd.log_path() == os.path.join(
+                  _tmp, "plan-mode-autoallow", "judgments.jsonl"))
     os.environ["PLAN_MODE_AUTOALLOW_LOG"] = os.path.join(
-        _tmp, "made", "up", "denied.jsonl")
+        _tmp, "made", "up", "judgments.jsonl")
     run_main("rm -rf /tmp/w")
     log_check("missing parent directories are created",
-              os.path.exists(os.path.join(_tmp, "made", "up", "denied.jsonl")))
+              os.path.exists(os.path.join(_tmp, "made", "up",
+                                          "judgments.jsonl")))
 finally:
     if _saved_env is None:
         os.environ.pop("PLAN_MODE_AUTOALLOW_LOG", None)
@@ -814,8 +970,6 @@ print("log: %d/%d passed" % (len(log_checks) - log_fail, len(log_checks)))
 # --- testing here is the routing around it, and that has to stay deterministic.
 # --- Whether the real model answers well is a separate question, measured by
 # --- tests/eval_llm.py against live calls.
-import readonly_cmd as rc
-
 llm_checks = []
 
 
@@ -855,7 +1009,8 @@ def with_classifier(answer, command, enabled=True, cwd=None):
 
 _llm_tmp = tempfile.mkdtemp(prefix="autoallow-llm-")
 _llm_saved = os.environ.get("PLAN_MODE_AUTOALLOW_LOG")
-os.environ["PLAN_MODE_AUTOALLOW_LOG"] = os.path.join(_llm_tmp, "denied.jsonl")
+os.environ["PLAN_MODE_AUTOALLOW_LOG"] = os.path.join(_llm_tmp,
+                                                     "judgments.jsonl")
 try:
     allowed, asked = with_classifier(True, "docker ps")
     llm_check("a yes on an unknown command allows it", allowed and asked)
@@ -878,7 +1033,7 @@ try:
     for name in ("rm -rf /tmp/x", "sudo ls", "chmod 777 f", "sh -c id",
                  "kill 1", "mkfs.ext4 /dev/sda", "fsck.ext4 /dev/sda"):
         allowed, asked = with_classifier(True, name)
-        llm_check("hard deny is not referred out: %s" % name,
+        llm_check("a known executor is not referred out: %s" % name,
                   not allowed and not asked)
 
     # A yes buys one command name, not a pass on the rest of the line.
@@ -895,18 +1050,24 @@ try:
               "docker" not in rc.ALWAYS_OK
               and rc.explain("docker ps") is not None)
 
-    allowed_path = rc.allowed_log_path()
-    llm_check("verdicts are recorded beside the denials",
-              allowed_path == os.path.join(_llm_tmp, "allowed.jsonl")
-              and os.path.exists(allowed_path))
-    entry = _json.loads(open(allowed_path, encoding="utf-8").readline())
-    llm_check("the record keys on the command name",
-              entry["name"] == "docker" and entry["command"] == "docker ps")
+    _judgments = rc.log_path()
+    _rows = [r for r in read_log(_judgments)
+             if r.get("rule") == rc.CLASSIFIER_ALLOW_RULE]
+    llm_check("the verdict goes in the same log as every other judgment",
+              _rows and _rows[0]["detail"] == "docker"
+              and _rows[0]["head"] == "docker ps")
 
     # A cached verdict stands on its own, without asking again.
     allowed, asked = with_classifier(False, "docker ps")
     llm_check("a cached yes is reused and the model is not consulted",
               allowed and not asked)
+
+    # The body is the cache. Collect it and the question is asked again rather
+    # than answered from a line that no longer proves which command it was.
+    os.remove(os.path.join(rc.bodies_dir(_judgments), _rows[0]["ref"]))
+    allowed, asked = with_classifier(True, "docker ps")
+    llm_check("a collected body is a cache miss, not a stale hit",
+              allowed and asked)
 finally:
     if _llm_saved is None:
         os.environ.pop("PLAN_MODE_AUTOALLOW_LOG", None)

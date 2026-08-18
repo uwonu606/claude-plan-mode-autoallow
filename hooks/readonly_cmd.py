@@ -1412,18 +1412,6 @@ def llm_enabled():
     return os.environ.get(LLM_ENV, "").strip().lower() in LLM_ON
 
 
-def allowed_log_path(denied=None):
-    """Sibling of the denial log, holding the commands the classifier passed."""
-    denied = denied or log_path()
-    if not denied:
-        return None
-    import os
-
-    directory, name = os.path.split(denied)
-    return os.path.join(directory, name.replace("denied", "allowed", 1)
-                        if "denied" in name else "allowed.jsonl")
-
-
 def cached_allow(command):
     """True when the classifier has already passed this exact command line.
 
@@ -1431,17 +1419,38 @@ def cached_allow(command):
     until someone deletes the line. That is the point of keying on the exact
     string -- the same line gets the same answer today and next month, instead
     of a fresh roll of the dice each time it appears.
+
+    `bytes` and `head` narrow the search; the body decides it. A body that has
+    been collected is a miss, and asking again is the right answer: the
+    judgment line alone no longer proves which command line it stood for.
     """
-    path = allowed_log_path()
+    import os
+
+    path = log_path()
     if not path:
         return False
+    blob = command.encode("utf-8")
+    head = command.split("\n", 1)[0][:HEAD_LEN]
+    directory = bodies_dir(path)
     try:
         with open(path, "r", encoding="utf-8") as handle:
             for line in handle:
                 try:
-                    if json.loads(line).get("command") == command:
-                        return True
+                    record = json.loads(line)
                 except ValueError:
+                    continue
+                if record.get("rule") != CLASSIFIER_ALLOW_RULE:
+                    continue
+                if record.get("bytes") != len(blob) or record.get("head") != head:
+                    continue
+                ref = record.get("ref")
+                if not ref:
+                    continue
+                try:
+                    with open(os.path.join(directory, ref), "rb") as body:
+                        if body.read() == blob:
+                            return True
+                except (IOError, OSError):
                     continue
     except (IOError, OSError):
         pass
@@ -1449,37 +1458,8 @@ def cached_allow(command):
 
 
 def record_allow(command, name, cwd=None):
-    """Append one verdict. Never raises -- the decision is already made."""
-    try:
-        import os
-        import time
-
-        path = allowed_log_path()
-        if not path:
-            return
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, mode=0o700, exist_ok=True)
-        try:
-            if os.path.getsize(path) > LOG_MAX_BYTES:
-                os.replace(path, path + ".1")
-        except OSError:
-            pass
-        record = {
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "name": name,
-            "command": command,
-        }
-        if isinstance(cwd, str) and cwd:
-            record["cwd"] = cwd
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        try:
-            os.write(fd, (json.dumps(record, ensure_ascii=False) + "\n")
-                     .encode("utf-8"))
-        finally:
-            os.close(fd)
-    except Exception:
-        pass
+    """Record a classifier pass as one more judgment, keyed by command name."""
+    record_judgment(command, CLASSIFIER_ALLOW_RULE, name, cwd)
 
 
 def llm_says_read_only(command):
@@ -1545,22 +1525,65 @@ def llm_second_opinion(command, verdict, cwd=None):
     return True
 
 
-# ------------------------------------------------------------- denial log
+# ----------------------------------------------------------- judgment log
 
-# Commands that were not auto-allowed are appended here so the allowlist can be
-# widened from evidence instead of guesswork. The log lives in its own directory
-# rather than loose in ~/.claude: the rotated file is a second entry, and the
-# directory gives the README a place to sit, so someone who finds the log
-# without knowing the hook can work out what wrote it and how to read it.
+# Every command the hook did not auto-allow is appended here, so the allowlist
+# can be widened from evidence instead of guesswork. There is one file, not one
+# per verdict: the axis the hook already knows (allowed / denied) carries no
+# information, and the axis that does -- did the parser prove this writes, or
+# admit it does not know -- is computed by replay() at read time. Promote a rule
+# and the lines it covers leave the open list on their own.
+#
+# The log lives in its own directory rather than loose in ~/.claude: the bodies
+# are a second entry, and the directory gives the README a place to sit, so
+# someone who finds the log without knowing the hook can work out what wrote it
+# and how to read it.
 LOG_ENV = "PLAN_MODE_AUTOALLOW_LOG"
 LOG_DIRNAME = "plan-mode-autoallow"
-LOG_BASENAME = "denied.jsonl"
-LOG_MAX_BYTES = 2 * 1024 * 1024
+LOG_BASENAME = "judgments.jsonl"
 LOG_OFF = {"", "off", "0", "no", "false", "none"}
+
+# Command lines live beside the judgments rather than inside them. That is what
+# lets the judgments file be append-only: a line is ~470 B, so a year of it is
+# ~2 MB, while the bodies are where the volume and the sensitivity collect.
+BODIES_DIRNAME = "bodies"
+BODIES_MAX_BYTES = 2 * 1024 * 1024
+HEAD_LEN = 160
+
+# The rule a classifier pass is filed under. It is a judgment like any other,
+# and the one whose replay disagreeing means "the parser could be taught this".
+CLASSIFIER_ALLOW_RULE = "allowed by classifier"
+
+# Not a verdict about the command: the body was collected, so there is nothing
+# to re-judge. Readers that compare verdicts have to set these aside rather than
+# count them as a change of mind.
+UNREPLAYABLE_RULE = "body unavailable"
+
+# The rules that are admissions rather than proofs. Membership is the whole
+# definition of "open command": the parser said it did not know, or could not
+# check. Redirection, heredocs, known executors and the rest proved the line
+# writes -- they are answered, not open, and re-reading them every cycle is how
+# the old log buried the fifteen names that were actually questions.
+#
+# `git` and `gh` are the coarse two. Their rule constant is what is left after
+# the subcommand is stripped out, so it covers both halves of "this subcommand
+# is not in the read set" -- `git frobnicate`, which is a question, and `git
+# push`, which is not. Separating them would mean enumerating the write
+# subcommands of two tools whose surface is exactly what the read set exists to
+# avoid enumerating, so the detail column is where that reading happens.
+OPEN_RULES = frozenset({
+    UNKNOWN_COMMAND_RULE,
+    "git",                                        # a git subcommand not read
+    "gh",                                         # a gh subcommand not read
+    "git branch operand",                         # listing forms it cannot say
+    "cd before git: target repo unreadable",      # fail closed, not a proof
+    "cd before git: cd target not identifiable",
+    "cd before git: network-touching git verb",
+})
 
 
 def log_path():
-    """Where to append denials, or None when logging is switched off."""
+    """Where to append judgments, or None when logging is switched off."""
     import os
 
     configured = os.environ.get(LOG_ENV)
@@ -1574,17 +1597,84 @@ def log_path():
     return os.path.join(base, LOG_DIRNAME, LOG_BASENAME)
 
 
-def log_denial(command, verdict, cwd=None):
-    """Append one JSON line. Never raises -- logging must not gate a decision.
+def bodies_dir(path):
+    """Where the command lines for `path` live."""
+    import os
 
-    Imports live in the function body: this runs only when a command was
-    rejected, and the hook's cost is dominated by module import on the path
+    return os.path.join(os.path.dirname(path), BODIES_DIRNAME)
+
+
+def collect_bodies(directory):
+    """Drop the oldest bodies once the directory passes its ceiling.
+
+    Only the bodies are collected. A judgment whose body is gone still replays
+    -- as `body unavailable` -- so the count of what was refused survives even
+    when the text of it does not.
+    """
+    import os
+
+    entries = []
+    total = 0
+    for name in os.listdir(directory):
+        try:
+            stat = os.stat(os.path.join(directory, name))
+        except OSError:
+            continue
+        entries.append((stat.st_mtime, stat.st_size,
+                        os.path.join(directory, name)))
+        total += stat.st_size
+    if total <= BODIES_MAX_BYTES:
+        return
+    for _, size, path in sorted(entries):
+        if total <= BODIES_MAX_BYTES:
+            return
+        try:
+            os.remove(path)
+            total -= size
+        except OSError:
+            pass
+
+
+def write_body(command, directory):
+    """Store a command line and return the ref that names it.
+
+    Content-addressed, so the same line written twice is one file. That is a
+    side effect rather than the point: the point is that the judgment and the
+    text it was passed on are separately sized and separately kept.
+    """
+    import hashlib
+    import os
+
+    blob = command.encode("utf-8")
+    ref = hashlib.sha256(blob).hexdigest()[:16]
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    try:
+        fd = os.open(os.path.join(directory, ref),
+                     os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except OSError:
+        return ref  # already stored: the content is the name
+    try:
+        os.write(fd, blob)
+    finally:
+        os.close(fd)
+    collect_bodies(directory)
+    return ref
+
+
+def record_judgment(command, rule, detail, cwd=None, ts=None):
+    """Append one judgment. Never raises -- the decision is already made.
+
+    Imports live in the function body: this runs only when a command was not
+    auto-allowed, and the hook's cost is dominated by module import on the path
     that matters (a command that gets allowed).
 
     `rule` and `detail` are what make the file a dataset rather than a pile of
-    sentences -- see report(). `reason` is kept alongside them because the first
-    way anyone reads this file is `tail`, and a sentence survives that better
-    than two fields the reader has to recombine.
+    sentences -- see report(). There is no `reason`: it was the two of them
+    joined, and `head` serves the one thing it was kept for, which is that the
+    first way anyone reads this file is `tail`.
+
+    Nothing rotates. The file is a regression suite, and rotation quietly drops
+    the oldest test cases two cycles later.
     """
     try:
         import os
@@ -1596,22 +1686,17 @@ def log_denial(command, verdict, cwd=None):
         parent = os.path.dirname(path)
         if parent:
             os.makedirs(parent, mode=0o700, exist_ok=True)
-        # Rotate rather than truncate, so a burst of denials cannot discard the
-        # very entries that motivated looking at the file.
-        try:
-            if os.path.getsize(path) > LOG_MAX_BYTES:
-                os.replace(path, path + ".1")
-        except OSError:
-            pass
+        blob = command.encode("utf-8")
         record = {
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "rule": verdict["rule"],
-            "detail": verdict["detail"],
-            "reason": verdict["reason"],
-            "command": command,
+            "ts": ts or time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "rule": rule,
+            "detail": detail,
         }
         if isinstance(cwd, str) and cwd:
             record["cwd"] = cwd
+        record["head"] = command.split("\n", 1)[0][:HEAD_LEN]
+        record["ref"] = write_body(command, bodies_dir(path))
+        record["bytes"] = len(blob)
         line = json.dumps(record, ensure_ascii=False) + "\n"
         # O_APPEND keeps concurrent hook processes from interleaving, and the
         # mode matters because command lines can carry anything the agent typed.
@@ -1624,8 +1709,53 @@ def log_denial(command, verdict, cwd=None):
         pass
 
 
+def log_denial(command, verdict, cwd=None):
+    """Record a parser refusal."""
+    record_judgment(command, verdict["rule"], verdict["detail"], cwd)
+
+
+def load_judgments(path=None):
+    """Judgments with their bodies read back in, oldest first.
+
+    A record whose body has been collected keeps everything but `command`.
+    replay() turns that absence into a verdict of its own rather than a guess.
+    """
+    import os
+
+    path = path or log_path()
+    if not path:
+        return []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return []
+    directory = bodies_dir(path)
+    records = []
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        ref = record.get("ref")
+        if ref and "command" not in record:
+            try:
+                with open(os.path.join(directory, ref), "rb") as body:
+                    record["command"] = body.read().decode("utf-8", "replace")
+            except (IOError, OSError):
+                pass
+        records.append(record)
+    return records
+
+
 def load_log(path):
-    """Records from the log and its rotated predecessor, oldest first."""
+    """Records from a legacy log and its rotated predecessor, oldest first.
+
+    The old format carried the command line inline, which is why migrate() can
+    hand these straight to replay() without a special case.
+    """
     records = []
     for candidate in (path + ".1", path):
         try:
@@ -1641,34 +1771,72 @@ def load_log(path):
     return records
 
 
-def report(path=None):
-    """Summarise the denial log: which rules fire, and on what.
+def replay(records):
+    """Re-judge stored commands with today's parser. The one primitive here.
 
-    Grouped by `rule` rather than `reason`, because a rule that embeds a value
-    -- "output redirection to 'a.txt'" -- would otherwise land in a bucket of
-    one and never rise to the top of the list, which is the whole reason to
+    --report, --open, --regress and --migrate are all thin callers of it. The
+    open list and the aggregates are views computed when someone looks, not
+    files that have to be compacted every time a rule is promoted -- and the
+    same call is how a parser change is measured against 22 days of real
+    command lines without a network round trip or a token.
+    """
+    verdicts = []
+    for record in records:
+        command = record.get("command")
+        if not isinstance(command, str) or not command:
+            verdicts.append({"rule": UNREPLAYABLE_RULE,
+                             "detail": record.get("ref"),
+                             "reason": UNREPLAYABLE_RULE})
+            continue
+        verdicts.append(explain(command, cwd=record.get("cwd")))
+    return verdicts
+
+
+def shorten(text, width=80):
+    flat = " ".join((text or "").split())
+    return flat if len(flat) <= width else flat[:width - 3] + "..."
+
+
+def report(path=None):
+    """Summarise the log as today's parser judges it.
+
+    Grouped by `rule` rather than by the sentence, because a rule that embeds a
+    value -- "output redirection to 'a.txt'" -- would otherwise land in a bucket
+    of one and never rise to the top of the list, which is the whole reason to
     read this file.
+
+    The counts are replay verdicts, not stored ones. What the parser decided
+    last month is history; what it decides now is what a promotion has to move.
     """
     path = path or log_path()
     if not path:
         print("logging is disabled (%s)" % LOG_ENV)
         return 1
-    records = load_log(path)
+    records = load_judgments(path)
     if not records:
         print("%s: no entries" % path)
         return 0
+    verdicts = replay(records)
 
     by_rule = {}
-    for record in records:
-        # Records written before rules were split carry only a reason.
-        rule = record.get("rule") or record.get("reason", "?")
-        detail = record.get("detail")
+    allowed = missing = open_count = 0
+    for verdict in verdicts:
+        if verdict is None:
+            allowed += 1
+            continue
+        rule = verdict["rule"]
+        if rule == UNREPLAYABLE_RULE:
+            missing += 1
+        if rule in OPEN_RULES:
+            open_count += 1
         counts = by_rule.setdefault(rule, {})
-        counts[detail] = counts.get(detail, 0) + 1
+        counts[verdict["detail"]] = counts.get(verdict["detail"], 0) + 1
 
-    print("%s\n%d denials, %d rules, %s .. %s\n"
-          % (path, len(records), len(by_rule),
-             records[0].get("ts", "?"), records[-1].get("ts", "?")))
+    print("%s\n%d judgments, %s .. %s\nreplayed: %d auto-allowed, %d refused "
+          "in %d rules (%d open, %d body collected)\n"
+          % (path, len(records), records[0].get("ts", "?"),
+             records[-1].get("ts", "?"), allowed, len(records) - allowed,
+             len(by_rule), open_count, missing))
     for rule, details in sorted(by_rule.items(),
                                 key=lambda kv: -sum(kv[1].values())):
         top = sorted((d for d in details.items() if d[0]), key=lambda kv: -kv[1])
@@ -1679,47 +1847,188 @@ def report(path=None):
         if shown:
             print("       %s" % shown)
 
+    # What the classifier passed and the parser still cannot express. The name
+    # is the aggregation key because the name is what gets added to the parser;
+    # a verdict the parser now reaches on its own drops out of this list by
+    # replaying clean, which is the point of computing it here.
+    candidates = {}
+    for record, verdict in zip(records, verdicts):
+        if record.get("rule") == CLASSIFIER_ALLOW_RULE and verdict is not None:
+            candidates.setdefault(record.get("detail") or "?", []).append(
+                record.get("head") or "")
+    if candidates:
+        print("\n%d commands the classifier passed and the parser cannot "
+              "express -- candidates to teach it:\n" % len(candidates))
+        for name, heads in sorted(candidates.items(),
+                                  key=lambda kv: -len(kv[1])):
+            print("%5d  %s" % (len(heads), name))
+            for example in sorted(set(heads))[:3]:
+                print("       %s" % shorten(example))
+            if len(set(heads)) > 3:
+                print("       (+%d more)" % (len(set(heads)) - 3))
+
     print("\nlast %d commands:" % min(10, len(records)))
     for record in records[-10:]:
-        flat = " ".join(record.get("command", "").split())
-        if len(flat) > 88:
-            flat = flat[:85] + "..."
-        print("  %s  %s" % (record.get("ts", "?")[:16], flat))
-    report_allowed(path)
+        print("  %s  %s" % (record.get("ts", "?")[:16],
+                            shorten(record.get("head"), 88)))
     return 0
 
 
-def report_allowed(denied=None):
-    """List what the classifier passed, grouped by command name.
+def open_report(path=None):
+    """Only the judgments where the parser said it did not know.
 
-    Printed with the denials because the two halves answer one question between
-    them. The denial log says what nothing would allow; this says what the
-    parser could not express but the classifier recognised, and the name is the
-    aggregation key because the name is what would be added to the parser.
+    This is the list that decides what to read each cycle. A rule belongs here
+    when it is an admission -- an unrecognised name, a repository that could not
+    be inspected -- and not when the parser proved the line writes. Nothing is
+    deleted to keep it short: promote a rule and its lines fall out on their own.
     """
-    path = allowed_log_path(denied)
+    path = path or log_path()
     if not path:
-        return
-    records = load_log(path)
-    if not records:
-        return
+        print("logging is disabled (%s)" % LOG_ENV)
+        return 1
+    records = load_judgments(path)
+    verdicts = replay(records)
 
-    by_name = {}
-    for record in records:
-        by_name.setdefault(record.get("name") or "?", []).append(
-            record.get("command", ""))
+    buckets = {}
+    for record, verdict in zip(records, verdicts):
+        if verdict is None or verdict["rule"] not in OPEN_RULES:
+            continue
+        buckets.setdefault((verdict["rule"], verdict["detail"]), []).append(
+            record.get("head") or "")
 
-    print("\n%s\n%d classifier verdicts, %d commands -- candidates to teach "
-          "the parser:\n" % (path, len(records), len(by_name)))
-    for name, commands in sorted(by_name.items(), key=lambda kv: -len(kv[1])):
-        print("%5d  %s" % (len(commands), name))
-        for example in sorted(set(commands))[:3]:
-            flat = " ".join(example.split())
-            if len(flat) > 80:
-                flat = flat[:77] + "..."
-            print("       %s" % flat)
-        if len(set(commands)) > 3:
-            print("       (+%d more)" % (len(set(commands)) - 3))
+    print("%s\n%d open of %d judgments\n"
+          % (path, sum(len(v) for v in buckets.values()), len(records)))
+    for (rule, detail), heads in sorted(buckets.items(),
+                                        key=lambda kv: -len(kv[1])):
+        print("%5d  %s%s" % (len(heads), rule, ": %s" % detail if detail else ""))
+        for example in sorted(set(heads))[:3]:
+            print("       %s" % shorten(example))
+    return 0
+
+
+def regress(path=None):
+    """Compare the judgment that was stored with the one the parser gives now.
+
+    The log holds both halves of the suite -- what must keep being refused and
+    what must keep being auto-allowed -- so a parser change that flips either
+    direction shows up here. The first list is the one to read line by line: it
+    is exactly what was just opened up.
+    """
+    path = path or log_path()
+    if not path:
+        print("logging is disabled (%s)" % LOG_ENV)
+        return 1
+    records = load_judgments(path)
+    verdicts = replay(records)
+
+    opened, closed, moved, unreplayable = [], [], 0, 0
+    for record, verdict in zip(records, verdicts):
+        # A collected body is not a change of mind, and counting it as one
+        # fills the list this exists to be read line by line.
+        if verdict is not None and verdict["rule"] == UNREPLAYABLE_RULE:
+            unreplayable += 1
+            continue
+        was_allowed = record.get("rule") == CLASSIFIER_ALLOW_RULE
+        now_allowed = verdict is None
+        if was_allowed == now_allowed:
+            if not now_allowed and verdict["rule"] != record.get("rule"):
+                moved += 1
+            continue
+        (opened if now_allowed else closed).append((record, verdict))
+
+    print("%s\n%d judgments replayed, %d skipped (body collected)\n"
+          % (path, len(records), unreplayable))
+    print("refused -> auto-allowed: %d  (read every one for a write)"
+          % len(opened))
+    for record, _ in opened:
+        print("  %-46s %s" % (shorten(record.get("rule"), 46),
+                              shorten(record.get("head"), 60)))
+    print("\nauto-allowed -> refused: %d" % len(closed))
+    for record, verdict in closed:
+        print("  %-46s %s" % (shorten(verdict["rule"], 46),
+                              shorten(record.get("head"), 60)))
+    print("\nstill refused under a different rule: %d" % moved)
+    return 0
+
+
+def migrate(path=None):
+    """Fold the two legacy logs into judgments.jsonl, replaying as it goes.
+
+    What the parser now settles by itself is not carried over in either
+    direction: a denial it would allow today would sit in the open list forever
+    describing a question already answered, and a classifier verdict it can now
+    express is a promotion that already happened. Both survive in the `.0`
+    files this leaves behind, which is also what makes a second run a no-op.
+    """
+    import os
+
+    path = path or log_path()
+    if not path:
+        print("logging is disabled (%s)" % LOG_ENV)
+        return 1
+    directory = os.path.dirname(path) or "."
+
+    def legacy(name):
+        source = os.path.join(directory, name)
+        if os.path.abspath(source) == os.path.abspath(path):
+            return []  # the destination is the source; nothing to fold in
+        return load_log(source)
+
+    skipped = 0
+
+    def bodyless(record):
+        # A legacy line with no command carries nothing to replay or store.
+        # Counted apart from the drops, which are a statement about the parser.
+        command = record.get("command")
+        return not isinstance(command, str) or not command
+
+    moved = dropped = 0
+    records = legacy("denied.jsonl")
+    for record, verdict in zip(records, replay(records)):
+        if bodyless(record):
+            skipped += 1
+            continue
+        if verdict is None:
+            dropped += 1
+            continue
+        record_judgment(record["command"], verdict["rule"], verdict["detail"],
+                        record.get("cwd"), record.get("ts"))
+        moved += 1
+
+    kept = shed = 0
+    records = legacy("allowed.jsonl")
+    for record, verdict in zip(records, replay(records)):
+        if bodyless(record):
+            skipped += 1
+            continue
+        if verdict is None:
+            shed += 1
+            continue
+        record_judgment(record["command"], CLASSIFIER_ALLOW_RULE,
+                        record.get("name"), record.get("cwd"),
+                        record.get("ts"))
+        kept += 1
+
+    archived = []
+    for name in ("denied.jsonl", "denied.jsonl.1",
+                 "allowed.jsonl", "allowed.jsonl.1"):
+        source = os.path.join(directory, name)
+        if os.path.abspath(source) == os.path.abspath(path):
+            continue
+        try:
+            os.replace(source, source + ".0")
+            archived.append(name + " -> " + name + ".0")
+        except OSError:
+            continue
+
+    print("%s\ndenials: %d carried, %d dropped (the parser allows them now)\n"
+          "classifier verdicts: %d carried, %d dropped (the parser expresses "
+          "them now)" % (path, moved, dropped, kept, shed))
+    if skipped:
+        print("skipped: %d legacy lines carried no command" % skipped)
+    for line in archived:
+        print("archived: %s" % line)
+    return 0
 
 
 # ---------------------------------------------------------------- entrypoint
@@ -1750,7 +2059,15 @@ def main():
     }))
 
 
+REPORTERS = {
+    "--report": report,
+    "--open": open_report,
+    "--regress": regress,
+    "--migrate": migrate,
+}
+
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--report":
-        sys.exit(report(sys.argv[2] if len(sys.argv) > 2 else None))
+    if len(sys.argv) > 1 and sys.argv[1] in REPORTERS:
+        sys.exit(REPORTERS[sys.argv[1]](
+            sys.argv[2] if len(sys.argv) > 2 else None))
     main()
