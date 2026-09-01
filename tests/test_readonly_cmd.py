@@ -1130,12 +1130,63 @@ for _name, _ok in llm_checks:
 print("llm: %d/%d passed" % (len(llm_checks) - llm_fail, len(llm_checks)))
 
 
+# --- appended: the scratchpad exception. Every write was refused, which is
+# --- right for the project tree and wrong for the one directory a read-only
+# --- planner has to write in -- `explore-model` builds a throwaway harness
+# --- under the session scratchpad and reruns it as the model is corrected, so
+# --- each rewrite was costing an approval the skill was written to avoid.
+# --- Writes whose destination is provably inside that directory are allowed.
+# --- Running what was written is not: the parser cannot read a script, and
+# --- allowing both halves turns the pair into arbitrary code execution inside
+# --- plan mode. That asymmetry is the rule, so both halves are tested here.
+
+_SC = ("/tmp/claude-1000/-home-user-proj/"
+       "6c5bce46-7e93-42d5-ad24-4b1533001932/scratchpad")
+
+SCRATCH = [
+    # writes landing inside the scratchpad
+    ("echo hi > %s/out.txt" % _SC, None),
+    ("grep -rn foo src/ >> %s/log.txt" % _SC, None),
+    ("gh issue view 1 --json title > %s/i.json" % _SC, None),
+    ("cat > %s/h.py <<'EOF'\nSTATES = []\nEOF" % _SC, None),
+    ('cat > %s/h.py <<"EOF"\nSTATES = []\nEOF' % _SC, None),
+    ("cat > %s/h.py <<-'EOF'\n\tx\n\tEOF" % _SC, None),
+    # running what was written stays a prompt -- this is the half that must not
+    # open, or the two together are arbitrary code execution
+    ("python3 %s/h.py" % _SC, "known write/exec command"),
+    ("bash %s/h.py" % _SC, "known write/exec command"),
+    # an unquoted delimiter expands `$(...)` in the body: that body is code
+    ("cat > %s/h.py <<EOF\nx\nEOF" % _SC, "heredoc"),
+    # heredoc ahead of the redirect -- the flag cannot be set by a redirect the
+    # tokenizer has not reached yet, so this stays refused on purpose
+    ("cat <<'EOF' > %s/h.py\nx\nEOF" % _SC, "heredoc"),
+    # a heredoc with no scratchpad write anywhere on the line
+    ("bash <<'EOF'\nrm -rf /\nEOF", "heredoc"),
+    # destinations that only look like the scratchpad
+    ("echo x > %s/../../../etc/passwd" % _SC, "output redirection to"),
+    ("echo x > /tmp/evil.sh", "output redirection to"),
+    ("echo x > /tmp/claude-1000/scratchpad/x", "output redirection to"),
+    ("echo x > /tmp/claude-abc/p/s/scratchpad/x", "output redirection to"),
+    ("echo x > %s/" % _SC, "output redirection to"),
+    # the body is dropped from the token stream, so what is left still has to
+    # clear every other rule
+    ("rm -rf src/ > %s/out.txt" % _SC, "known write/exec command"),
+]
+scratch_fail = 0
+for _cmd, _rule in SCRATCH:
+    _v = rc.explain(_cmd)
+    if (_v is None) != (_rule is None) or (_v and _v["rule"] != _rule):
+        print("FAIL (scratchpad, want %r): %r -> %r" % (_rule, _cmd, _v))
+        scratch_fail += 1
+print("scratchpad: %d/%d passed" % (len(SCRATCH) - scratch_fail, len(SCRATCH)))
+
+
 total = (len(ALLOW) + len(DENY) + len(EXTRA) + len(HARDENING) + len(GH)
          + _tools + len(GITPROMOTE) + len(KNOWN_EXEC)
          + len(KNOWN_SUB) + len(open_checks) + len(cdgit_checks)
-         + len(log_checks) + len(llm_checks))
+         + len(log_checks) + len(llm_checks) + len(SCRATCH))
 total_fail = (fails + extra_fail + hard_fail + gh_fail + tool_fail
               + promote_fail + known_fail + sub_fail + open_fail
-              + cdgit_fail + log_fail + llm_fail)
+              + cdgit_fail + log_fail + llm_fail + scratch_fail)
 print("TOTAL: %d/%d passed" % (total - total_fail, total))
 sys.exit(1 if total_fail else 0)
