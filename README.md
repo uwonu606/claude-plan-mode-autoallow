@@ -58,7 +58,9 @@ auto 모드에서 빌려온 것은 판정 방식이 아니라 **계층 구조**�
 
 `gh`는 따로 짚을 만하다. `gh api`는 GitHub API 전체에 대한 인증된 raw 클라이언트라, 할 수 있는 일이 곧 토큰의 스코프와 같다 — 흔한 `repo, workflow, gist, admin:public_key` 토큰이면 히스토리 재작성, `.github/workflows/*.yml` 쓰기(러너에서 저장소 시크릿을 쥔 채 임의 코드 실행), 계정에 SSH 키 추가가 전부 포함된다. `Bash(gh api *)` 같은 프리픽스 규칙으로는 "GET만"을 표현할 수 없고, 그래서 이 판정이 파서에 있어야 한다. 저장소 조사(`gh api repos/...`, `gh repo view`, `gh pr list`)는 통과하고, `gh api -X DELETE`, `gh repo create`, `gh pr merge`, `gh secret set`은 프롬프트로 간다.
 
-무조건 거부: `/dev/null` 계열이 아닌 대상으로의 출력 리다이렉션, 히어독, 프로세스 치환, 백틱, 간접 실행(`$CMD`, `eval`), 그리고 목록에 없는 모든 명령.
+거부: `/dev/null` 계열이 아닌 대상으로의 출력 리다이렉션, 히어독, 프로세스 치환, 백틱, 간접 실행(`$CMD`, `eval`), 그리고 목록에 없는 모든 명령.
+
+이 중 앞의 둘에만 예외가 있다. **세션 scratchpad**(`/tmp/claude-<uid>/<프로젝트>/<세션>/scratchpad/…`) 안으로 향하는 출력 리다이렉션은 통과하고, 그런 리다이렉션이 이미 선 줄에서 구분자가 따옴표로 묶인 히어독은 본문을 데이터로 건너뛴다. 읽기 전용 계획자도 쓸 곳이 하나는 필요하기 때문이다 — `explore-model` 이 탐색 하네스를 거기에 짓고 고쳐가며 다시 돌린다. **쓴 것을 실행하는 것은 예외가 아니다**(`python3 <scratchpad>/h.py` 는 계속 프롬프트다). 둘 다 열면 그 조합이 플랜 모드 안의 임의 코드 실행이 된다. 근거는 [ADR-0004](docs/adr/0004-the-scratchpad-is-the-one-writable-exception.md).
 
 목록에 없는 것 중에서도 **이름만으로 판정이 끝나는 것**은 따로 답한다. `rm`은 뒤에 뭐가 오든 삭제고, `python3`·`bash`·`xargs`는 무엇을 실행할지 줄에서 보이지 않는다. 이런 이름은 `known write/exec command`로 거부하고, `command not on read-only allowlist`는 **정말 처음 보는 이름**에만 남긴다. 두 판정을 가르는 기준은 하나다 — 이름 하나로 답이 정해지는가. `docker`나 `kubectl`은 주체를 가리킬 뿐 동사가 서브커맨드에 있어서 뒤쪽에 남는다. 미해결 명령 목록에서 답이 이미 정해진 것을 걷어내는 게 이 구분의 값이다.
 
