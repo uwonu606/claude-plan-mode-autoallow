@@ -1171,6 +1171,33 @@ SCRATCH = [
     # the body is dropped from the token stream, so what is left still has to
     # clear every other rule
     ("rm -rf src/ > %s/out.txt" % _SC, "known write/exec command"),
+    # The exception reads the target token as written -- the tokenizer expands
+    # nothing -- so it fires on a literal absolute path and on nothing else.
+    # Every form below resolves to the same directory at runtime and still
+    # prompts. That is the boundary, and it is pinned here rather than left to
+    # be rediscovered: the numbers this exception is justified by were measured
+    # with literal paths, and a reader comparing them against a session full of
+    # `S=...; cat > "$S/h.py"` would find them off by the whole benefit.
+    #
+    # Resolving the assignment was considered and refused. Over the judgment
+    # log's lifetime (324 records, 115 write refusals) the literal form
+    # accounts for 9 and the same-line variable form for 3, so the win is 3 --
+    # against giving the parser a symbol table it deliberately does not have
+    # ("assignment-only segments set a shell variable and run nothing"). The
+    # failure directions decide it: today a form it cannot read prompts, which
+    # is safe; a resolver that reads one wrong allows a write, which is not.
+    # The friction is answered on the other side instead -- the planner is told
+    # to write harness paths literally.
+    #
+    # Cross-call assignment needs no rule at all: the Bash tool does not carry
+    # shell state between calls, so `S=` in one call leaves `$S` empty in the
+    # next. Only the same-line form ever meant anything.
+    ('S=%s; echo x > "$S/out.txt"' % _SC, "output redirection to"),
+    ("S=%s; echo x > $S/out.txt" % _SC, "output redirection to"),
+    ('S=%s; echo x > "${S}/out.txt"' % _SC, "output redirection to"),
+    ("S=%s; cat > \"$S/h.py\" <<'EOF'\nx\nEOF" % _SC, "output redirection to"),
+    ("echo x > ./out.txt", "output redirection to"),
+    ("echo x > ~/scratch/out.txt", "output redirection to"),
 ]
 scratch_fail = 0
 for _cmd, _rule in SCRATCH:
