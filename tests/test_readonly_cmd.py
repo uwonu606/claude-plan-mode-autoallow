@@ -1181,12 +1181,73 @@ for _cmd, _rule in SCRATCH:
 print("scratchpad: %d/%d passed" % (len(SCRATCH) - scratch_fail, len(SCRATCH)))
 
 
+# --- appended: what holds the scratchpad exception shut. is_scratch_path is
+# --- lexical -- it never resolves the path -- so a symlink inside the
+# --- scratchpad pointing out of it would be written through. Nothing here
+# --- tests that, because it is true and is meant to be: what makes it
+# --- unreachable is that planting the link is refused. This bucket pins that
+# --- refusal, and pins WHICH KIND it is, because the two kinds have different
+# --- strength.
+# ---
+# --- A structural refusal cannot be talked out of: llm_second_opinion returns
+# --- early unless the rule is UNKNOWN_COMMAND_RULE, so a classifier YES never
+# --- reaches these lines. An unknown-name refusal is only as strong as the
+# --- classifier's judgment on that name -- the parser has no opinion about
+# --- `tar`, and a YES there would open the line. The real classifier refused
+# --- all six (measured, 2026-09-02), but that is a vote, not a proof, and the
+# --- split is what a reader needs to see. Promoting them the way `unzip` was
+# --- promoted -- a flag checker, since `tar tf` reads and `tar xf` writes --
+# --- is what would move them across the line.
+
+SYMLINK_STRUCTURAL = [
+    ("ln -s /etc/passwd %s/link" % _SC, "known write/exec command"),
+    ("ln -sf /etc/passwd %s/link" % _SC, "known write/exec command"),
+    ("cp -s /etc/passwd %s/link" % _SC, "known write/exec command"),
+    ("install -s /etc/passwd %s/link" % _SC, "known write/exec command"),
+    ("python3 -c \"import os; os.symlink('/etc/passwd','%s/l')\"" % _SC,
+     "known write/exec command"),
+    ("unzip evil.zip -d %s" % _SC, "unzip without a list flag extracts"),
+    ("unzip -o evil.zip", "unzip without a list flag extracts"),
+    ("git checkout other -- .", "known write/exec git subcommand"),
+    ("git clone https://example.com/r.git %s/r" % _SC,
+     "known write/exec git subcommand"),
+    ("gh repo clone o/r %s/r" % _SC, "known write/exec gh subcommand"),
+]
+# The classifier is the only gate on these. Listed so that promoting one to the
+# allowlist trips this test instead of quietly opening the link path.
+SYMLINK_CLASSIFIER_GATED = [
+    "tar xf evil.tar -C %s" % _SC,
+    "tar -xzf evil.tgz",
+    "rsync -a src/ %s/d/" % _SC,
+    "cpio -i < a.cpio",
+    "7z x evil.7z",
+    "bsdtar xf evil.tar",
+    "busybox ln -s /etc/passwd %s/link" % _SC,
+]
+symlink_fail = 0
+for _cmd, _rule in SYMLINK_STRUCTURAL:
+    _v = rc.explain(_cmd)
+    if not _v or _v["rule"] != _rule:
+        print("FAIL (symlink structural, want %r): %r -> %r"
+              % (_rule, _cmd, _v))
+        symlink_fail += 1
+for _cmd in SYMLINK_CLASSIFIER_GATED:
+    _v = rc.explain(_cmd)
+    if not _v or _v["rule"] != rc.UNKNOWN_COMMAND_RULE:
+        print("FAIL (symlink classifier-gated, want unknown name): %r -> %r"
+              % (_cmd, _v))
+        symlink_fail += 1
+_symlinks = len(SYMLINK_STRUCTURAL) + len(SYMLINK_CLASSIFIER_GATED)
+print("symlink: %d/%d passed" % (_symlinks - symlink_fail, _symlinks))
+
+
 total = (len(ALLOW) + len(DENY) + len(EXTRA) + len(HARDENING) + len(GH)
          + _tools + len(GITPROMOTE) + len(KNOWN_EXEC)
          + len(KNOWN_SUB) + len(open_checks) + len(cdgit_checks)
-         + len(log_checks) + len(llm_checks) + len(SCRATCH))
+         + len(log_checks) + len(llm_checks) + len(SCRATCH) + _symlinks)
 total_fail = (fails + extra_fail + hard_fail + gh_fail + tool_fail
               + promote_fail + known_fail + sub_fail + open_fail
-              + cdgit_fail + log_fail + llm_fail + scratch_fail)
+              + cdgit_fail + log_fail + llm_fail + scratch_fail
+              + symlink_fail)
 print("TOTAL: %d/%d passed" % (total - total_fail, total))
 sys.exit(1 if total_fail else 0)
