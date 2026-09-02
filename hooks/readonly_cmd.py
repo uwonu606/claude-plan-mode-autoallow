@@ -282,6 +282,47 @@ GH_READ_SUBCOMMANDS = {
 
 REDIR_OK_TARGETS = {"/dev/null", "/dev/stdout", "/dev/stderr"}
 
+# The session scratchpad is the one writable place a read-only planner needs.
+# `explore-model` builds a throwaway harness there and reruns it as the model is
+# corrected, and that skill's economics assume the rerun is cheap: "틀린 불변식의
+# 비용은 탐색 재실행 몇 초라, 매 호출의 승인 왕복보다 싸다". With no exception here
+# every rewrite is an approval round trip, which is the cost the skill was
+# written to avoid.
+#
+# The shape is fixed by the harness -- /tmp/claude-<uid>/<project-slug>/<session
+# -uuid>/scratchpad/... -- so this is an exact-depth check rather than a prefix
+# test, and `..` anywhere disqualifies the path outright. A symlink planted
+# inside the scratchpad would still resolve out of it, but planting one needs
+# `ln`, which is a KNOWN_EXECUTOR and prompts.
+#
+# Matched with string operations, not a regex: `re` is imported lazily further
+# down precisely because this module runs on every Bash call in plan mode, and a
+# module-level import would put that cost on all of them.
+SCRATCH_PREFIX = "/tmp/claude-"
+SCRATCH_MARK = "/scratchpad/"
+
+
+def is_scratch_path(target):
+    """True for a path inside this machine's session scratchpad, and only that."""
+    p = target.strip("\"'")
+    if not p.startswith(SCRATCH_PREFIX) or ".." in p:
+        return False
+    mark = p.find(SCRATCH_MARK)
+    if mark < 0 or not p[mark + len(SCRATCH_MARK):]:
+        return False
+    parts = p[:mark].split("/")
+    # ['', 'tmp', 'claude-<uid>', '<project-slug>', '<session-uuid>']
+    return (len(parts) == 5
+            and parts[2][len("claude-"):].isdigit()
+            and bool(parts[3]) and bool(parts[4]))
+
+
+# Set when a redirect on the current line resolved into the scratchpad. It is
+# what lets the heredoc branch tell `cat > <scratch>/h.py <<'EOF'` -- a harness
+# being written -- from `bash <<'EOF'`, which is a script being run. Cleared per
+# call in explain(), beside the other per-line state.
+SCRATCH_REDIRECT = []
+
 # rg can execute a preprocessor binary and read archives through helpers.
 RG_BAD_FLAGS = {"--pre", "--pre-glob", "--hostname-bin", "-z", "--search-zip"}
 
@@ -546,7 +587,19 @@ def tokenize(cmd, depth):
             raise Deny("process substitution")
 
         if cmd.startswith("<<", i):
-            raise Deny("heredoc")
+            # Allowed only for a line already redirecting into the scratchpad,
+            # and only with a quoted delimiter: an unquoted one expands
+            # `$(...)` in the body, which makes the body code rather than data.
+            # Consuming it drops the body from the token stream, so what is
+            # left still has to clear every other rule -- `bash <<'EOF'` keeps
+            # failing on `bash`. Every command that would execute the body is a
+            # KNOWN_EXECUTOR, so the body only ever reaches a reader.
+            #
+            # `cat <<'EOF' > <scratch>/h.py` -- heredoc before the redirect --
+            # is not recognised and still prompts. Conservative on purpose: the
+            # flag cannot be set by a redirect the tokenizer has not reached.
+            i = consume_heredoc(cmd, i)
+            continue
 
         if c == "<":
             flush()
@@ -591,6 +644,42 @@ def tokenize(cmd, depth):
     return tokens
 
 
+def consume_heredoc(cmd, i):
+    """Skip a quoted heredoc body writing into the scratchpad. Else raise Deny.
+
+    Returns the index just past the terminator line. The body is never parsed:
+    it is the file being written, not a command, and the gate in the caller
+    guarantees the only thing reading it is an allowlisted reader.
+    """
+    n = len(cmd)
+    j = i + 2
+    if j < n and cmd[j] == "-":     # <<- strips leading tabs from the terminator
+        j += 1
+    while j < n and cmd[j] in " \t":
+        j += 1
+    if not SCRATCH_REDIRECT or j >= n or cmd[j] not in "'\"":
+        raise Deny("heredoc")
+    quote = cmd[j]
+    close = cmd.find(quote, j + 1)
+    if close < 0:
+        raise Deny("unterminated heredoc")
+    delim = cmd[j + 1:close]
+    if not delim:
+        raise Deny("heredoc")
+    pos = cmd.find("\n", close)
+    if pos < 0:
+        raise Deny("unterminated heredoc")
+    pos += 1
+    while True:
+        eol = cmd.find("\n", pos)
+        line = cmd[pos:eol if eol >= 0 else n]
+        if line.strip() == delim:
+            return eol + 1 if eol >= 0 else n
+        if eol < 0:
+            raise Deny("unterminated heredoc")
+        pos = eol + 1
+
+
 def consume_output_redirect(cmd, i, buf, tokens):
     """Handle `>`/`>>` at position i. Returns the new index, or raises Deny."""
     pending = "".join(buf)
@@ -620,6 +709,9 @@ def consume_output_redirect(cmd, i, buf, tokens):
         j += 1
     target = cmd[i:j].strip("\"'")
     if target not in REDIR_OK_TARGETS:
+        if is_scratch_path(target):
+            SCRATCH_REDIRECT.append(target)
+            return j
         raise Deny("output redirection to %r", target)
     return j
 
@@ -1389,6 +1481,7 @@ def explain(command, extra_allowed=None, cwd=None):
     if not command or not command.strip():
         return {"rule": "empty command", "detail": None,
                 "reason": "empty command"}
+    del SCRATCH_REDIRECT[:]
     del SEEN_COMMANDS[:]
     del SEEN_CD_TARGETS[:]
     del SEEN_GIT_SUBCOMMANDS[:]

@@ -1130,12 +1130,151 @@ for _name, _ok in llm_checks:
 print("llm: %d/%d passed" % (len(llm_checks) - llm_fail, len(llm_checks)))
 
 
+# --- appended: the scratchpad exception. Every write was refused, which is
+# --- right for the project tree and wrong for the one directory a read-only
+# --- planner has to write in -- `explore-model` builds a throwaway harness
+# --- under the session scratchpad and reruns it as the model is corrected, so
+# --- each rewrite was costing an approval the skill was written to avoid.
+# --- Writes whose destination is provably inside that directory are allowed.
+# --- Running what was written is not: the parser cannot read a script, and
+# --- allowing both halves turns the pair into arbitrary code execution inside
+# --- plan mode. That asymmetry is the rule, so both halves are tested here.
+
+_SC = ("/tmp/claude-1000/-home-user-proj/"
+       "6c5bce46-7e93-42d5-ad24-4b1533001932/scratchpad")
+
+SCRATCH = [
+    # writes landing inside the scratchpad
+    ("echo hi > %s/out.txt" % _SC, None),
+    ("grep -rn foo src/ >> %s/log.txt" % _SC, None),
+    ("gh issue view 1 --json title > %s/i.json" % _SC, None),
+    ("cat > %s/h.py <<'EOF'\nSTATES = []\nEOF" % _SC, None),
+    ('cat > %s/h.py <<"EOF"\nSTATES = []\nEOF' % _SC, None),
+    ("cat > %s/h.py <<-'EOF'\n\tx\n\tEOF" % _SC, None),
+    # running what was written stays a prompt -- this is the half that must not
+    # open, or the two together are arbitrary code execution
+    ("python3 %s/h.py" % _SC, "known write/exec command"),
+    ("bash %s/h.py" % _SC, "known write/exec command"),
+    # an unquoted delimiter expands `$(...)` in the body: that body is code
+    ("cat > %s/h.py <<EOF\nx\nEOF" % _SC, "heredoc"),
+    # heredoc ahead of the redirect -- the flag cannot be set by a redirect the
+    # tokenizer has not reached yet, so this stays refused on purpose
+    ("cat <<'EOF' > %s/h.py\nx\nEOF" % _SC, "heredoc"),
+    # a heredoc with no scratchpad write anywhere on the line
+    ("bash <<'EOF'\nrm -rf /\nEOF", "heredoc"),
+    # destinations that only look like the scratchpad
+    ("echo x > %s/../../../etc/passwd" % _SC, "output redirection to"),
+    ("echo x > /tmp/evil.sh", "output redirection to"),
+    ("echo x > /tmp/claude-1000/scratchpad/x", "output redirection to"),
+    ("echo x > /tmp/claude-abc/p/s/scratchpad/x", "output redirection to"),
+    ("echo x > %s/" % _SC, "output redirection to"),
+    # the body is dropped from the token stream, so what is left still has to
+    # clear every other rule
+    ("rm -rf src/ > %s/out.txt" % _SC, "known write/exec command"),
+    # The exception reads the target token as written -- the tokenizer expands
+    # nothing -- so it fires on a literal absolute path and on nothing else.
+    # Every form below resolves to the same directory at runtime and still
+    # prompts. That is the boundary, and it is pinned here rather than left to
+    # be rediscovered: the numbers this exception is justified by were measured
+    # with literal paths, and a reader comparing them against a session full of
+    # `S=...; cat > "$S/h.py"` would find them off by the whole benefit.
+    #
+    # Resolving the assignment was considered and refused. Over the judgment
+    # log's lifetime (324 records, 115 write refusals) the literal form
+    # accounts for 9 and the same-line variable form for 3, so the win is 3 --
+    # against giving the parser a symbol table it deliberately does not have
+    # ("assignment-only segments set a shell variable and run nothing"). The
+    # failure directions decide it: today a form it cannot read prompts, which
+    # is safe; a resolver that reads one wrong allows a write, which is not.
+    # The friction is answered on the other side instead -- the planner is told
+    # to write harness paths literally.
+    #
+    # Cross-call assignment needs no rule at all: the Bash tool does not carry
+    # shell state between calls, so `S=` in one call leaves `$S` empty in the
+    # next. Only the same-line form ever meant anything.
+    ('S=%s; echo x > "$S/out.txt"' % _SC, "output redirection to"),
+    ("S=%s; echo x > $S/out.txt" % _SC, "output redirection to"),
+    ('S=%s; echo x > "${S}/out.txt"' % _SC, "output redirection to"),
+    ("S=%s; cat > \"$S/h.py\" <<'EOF'\nx\nEOF" % _SC, "output redirection to"),
+    ("echo x > ./out.txt", "output redirection to"),
+    ("echo x > ~/scratch/out.txt", "output redirection to"),
+]
+scratch_fail = 0
+for _cmd, _rule in SCRATCH:
+    _v = rc.explain(_cmd)
+    if (_v is None) != (_rule is None) or (_v and _v["rule"] != _rule):
+        print("FAIL (scratchpad, want %r): %r -> %r" % (_rule, _cmd, _v))
+        scratch_fail += 1
+print("scratchpad: %d/%d passed" % (len(SCRATCH) - scratch_fail, len(SCRATCH)))
+
+
+# --- appended: what holds the scratchpad exception shut. is_scratch_path is
+# --- lexical -- it never resolves the path -- so a symlink inside the
+# --- scratchpad pointing out of it would be written through. Nothing here
+# --- tests that, because it is true and is meant to be: what makes it
+# --- unreachable is that planting the link is refused. This bucket pins that
+# --- refusal, and pins WHICH KIND it is, because the two kinds have different
+# --- strength.
+# ---
+# --- A structural refusal cannot be talked out of: llm_second_opinion returns
+# --- early unless the rule is UNKNOWN_COMMAND_RULE, so a classifier YES never
+# --- reaches these lines. An unknown-name refusal is only as strong as the
+# --- classifier's judgment on that name -- the parser has no opinion about
+# --- `tar`, and a YES there would open the line. The real classifier refused
+# --- all six (measured, 2026-09-02), but that is a vote, not a proof, and the
+# --- split is what a reader needs to see. Promoting them the way `unzip` was
+# --- promoted -- a flag checker, since `tar tf` reads and `tar xf` writes --
+# --- is what would move them across the line.
+
+SYMLINK_STRUCTURAL = [
+    ("ln -s /etc/passwd %s/link" % _SC, "known write/exec command"),
+    ("ln -sf /etc/passwd %s/link" % _SC, "known write/exec command"),
+    ("cp -s /etc/passwd %s/link" % _SC, "known write/exec command"),
+    ("install -s /etc/passwd %s/link" % _SC, "known write/exec command"),
+    ("python3 -c \"import os; os.symlink('/etc/passwd','%s/l')\"" % _SC,
+     "known write/exec command"),
+    ("unzip evil.zip -d %s" % _SC, "unzip without a list flag extracts"),
+    ("unzip -o evil.zip", "unzip without a list flag extracts"),
+    ("git checkout other -- .", "known write/exec git subcommand"),
+    ("git clone https://example.com/r.git %s/r" % _SC,
+     "known write/exec git subcommand"),
+    ("gh repo clone o/r %s/r" % _SC, "known write/exec gh subcommand"),
+]
+# The classifier is the only gate on these. Listed so that promoting one to the
+# allowlist trips this test instead of quietly opening the link path.
+SYMLINK_CLASSIFIER_GATED = [
+    "tar xf evil.tar -C %s" % _SC,
+    "tar -xzf evil.tgz",
+    "rsync -a src/ %s/d/" % _SC,
+    "cpio -i < a.cpio",
+    "7z x evil.7z",
+    "bsdtar xf evil.tar",
+    "busybox ln -s /etc/passwd %s/link" % _SC,
+]
+symlink_fail = 0
+for _cmd, _rule in SYMLINK_STRUCTURAL:
+    _v = rc.explain(_cmd)
+    if not _v or _v["rule"] != _rule:
+        print("FAIL (symlink structural, want %r): %r -> %r"
+              % (_rule, _cmd, _v))
+        symlink_fail += 1
+for _cmd in SYMLINK_CLASSIFIER_GATED:
+    _v = rc.explain(_cmd)
+    if not _v or _v["rule"] != rc.UNKNOWN_COMMAND_RULE:
+        print("FAIL (symlink classifier-gated, want unknown name): %r -> %r"
+              % (_cmd, _v))
+        symlink_fail += 1
+_symlinks = len(SYMLINK_STRUCTURAL) + len(SYMLINK_CLASSIFIER_GATED)
+print("symlink: %d/%d passed" % (_symlinks - symlink_fail, _symlinks))
+
+
 total = (len(ALLOW) + len(DENY) + len(EXTRA) + len(HARDENING) + len(GH)
          + _tools + len(GITPROMOTE) + len(KNOWN_EXEC)
          + len(KNOWN_SUB) + len(open_checks) + len(cdgit_checks)
-         + len(log_checks) + len(llm_checks))
+         + len(log_checks) + len(llm_checks) + len(SCRATCH) + _symlinks)
 total_fail = (fails + extra_fail + hard_fail + gh_fail + tool_fail
               + promote_fail + known_fail + sub_fail + open_fail
-              + cdgit_fail + log_fail + llm_fail)
+              + cdgit_fail + log_fail + llm_fail + scratch_fail
+              + symlink_fail)
 print("TOTAL: %d/%d passed" % (total - total_fail, total))
 sys.exit(1 if total_fail else 0)
